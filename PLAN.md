@@ -42,7 +42,7 @@ This is the initial big obstacle, reading up on things and gaining a good unders
 
 # Framework implementation
 
-This repo is for implementing the framework for testing purposes, need to map out exact structure and implementation plan (should not be too hard, **~10 days should suffice**), can be done in parallel with reading and (if necessary) with some help from AI
+This repo is for implementing the framework for testing purposes, need to map out exact structure and implementation plan (should not be too hard), can be done in parallel with reading and (if necessary) with some help from AI
 
 # Potential ideas
 
