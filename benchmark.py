@@ -19,6 +19,23 @@ from diffusion.samplers import make_sampler
 from diffusion.schedulers import make_scheduler
 
 
+
+def _get_sample_shape(model, config: dict | None = None, default: tuple[int, ...] = (3, 32, 32)) -> tuple[int, ...]:
+    if hasattr(model, "sample_shape") and model.sample_shape is not None:
+        return tuple(model.sample_shape)
+    if config:
+        if "sample_shape" in config:
+            return tuple(config["sample_shape"])
+        if "channels" in config and "image_size" in config:
+            return (config["channels"], config["image_size"], config["image_size"])
+    unet = getattr(model, "unet", model)
+    if hasattr(unet, "config"):
+        channels = getattr(unet.config, "in_channels", 3)
+        size = getattr(unet.config, "sample_size", 32)
+        spatial = (size, size) if isinstance(size, int) else tuple(size)
+        return (channels, *spatial)
+    return default
+
 def run_benchmark(
     checkpoint: str | None = None,
     pretrained_model_id: str | None = None,
@@ -41,10 +58,7 @@ def run_benchmark(
     if checkpoint:
         print(f"Loading checkpoint from {checkpoint}...")
         model, scheduler, config, _ = load_checkpoint(checkpoint, device)
-        sample_shape = tuple(
-            config.get("sample_shape", (config.get("channels", 3), config.get("image_size", 32), config.get("image_size", 32)))
-        )
-    else:
+        sample_shape = _get_sample_shape(model, config)
         model_id = pretrained_model_id or DEFAULT_PRETRAINED_MODEL
         print(f"Loading pretrained model: {model_id}...")
         model = make_model(
@@ -59,10 +73,10 @@ def run_benchmark(
             beta_start=1e-4,
             beta_end=2e-2,
             pretrained_model_id=model_id,
-            pretrained_revision=pretrained_revision,
-            pretrained_scheduler_subfolder=pretrained_scheduler_subfolder,
+            revision=pretrained_revision,
+            pretrained_subfolder=pretrained_scheduler_subfolder,
         ).to(device)
-        sample_shape = tuple(model.sample_shape)
+        sample_shape = _get_sample_shape(model)
 
     model.eval()
     shape = (count, *sample_shape)
