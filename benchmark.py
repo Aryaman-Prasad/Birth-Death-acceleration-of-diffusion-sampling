@@ -57,6 +57,13 @@ def run_benchmark(
     steps_list: list[int] | None = None,
     eta: float = 0.0,
     bd_modifier: Any = None,
+    fid: bool = False,
+    fid_samples: int = 1000,
+    fid_batch_size: int = 64,
+    fid_dataset: str = "cifar10",
+    fid_data_dir: str = "data",
+    fid_download: bool = True,
+    no_ddpm: bool = False,
 ):
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -93,24 +100,52 @@ def run_benchmark(
     train_timesteps = scheduler.num_train_timesteps
 
     # Benchmark configurations:
-    # 1. Full ancestral DDPM (all training timesteps)
-    # 2. DDIM at varying steps (e.g. 100, 50, 25, 10)
     if steps_list is None:
         steps_list = [100, 50, 25, 10]
 
-    configs = [("ddpm", train_timesteps, 0.0, None)]
+    configs = []
+    if not no_ddpm:
+        configs.append(("ddpm", train_timesteps, 0.0, None))
     for s in steps_list:
         if s < train_timesteps:
             configs.append(("ddim", s, eta, None))
             if bd_modifier is not None:
                 configs.append(("ddim+bd", s, eta, [bd_modifier]))
 
+    # Load real reference images for FID if enabled
+    real_batches = []
+    if fid:
+        from diffusion.metrics import FIDEvaluator
+        from diffusion.datasets import make_data_module
+        from torch.utils.data import DataLoader
+
+        print(f"\n[+] Preparing FID reference data from {fid_dataset} ({fid_samples} images)...")
+        ref_module = make_data_module(fid_dataset, fid_data_dir, sample_shape[-1], fid_download, train=False)
+        ref_dataset = ref_module.dataset()
+        ref_loader = DataLoader(
+            ref_dataset, batch_size=fid_batch_size, shuffle=True,
+            num_workers=2 if device.type == "cuda" else 0,
+            pin_memory=device.type == "cuda"
+        )
+        remaining = fid_samples
+        for batch in ref_loader:
+            imgs = batch[0] if isinstance(batch, (tuple, list)) else batch
+            take = min(remaining, imgs.shape[0])
+            real_batches.append(imgs[:take])
+            remaining -= take
+            if remaining <= 0:
+                break
+        print(f"[+] Loaded {sum(b.shape[0] for b in real_batches)} reference images.")
+
     results = []
     csv_file = out_path / "benchmark_results.csv"
 
-    print("\n" + "=" * 75)
-    print(f"{'Sampler':<10} | {'Steps':<8} | {'Total Time (s)':<15} | {'Sec/Sample':<12} | {'Steps/Sec':<10}")
-    print("-" * 75)
+    print("\n" + "=" * (88 if fid else 75))
+    if fid:
+        print(f"{'Sampler':<10} | {'Steps':<8} | {'Total Time (s)':<15} | {'Sec/Sample':<12} | {'Steps/Sec':<10} | {'FID':<8}")
+    else:
+        print(f"{'Sampler':<10} | {'Steps':<8} | {'Total Time (s)':<15} | {'Sec/Sample':<12} | {'Steps/Sec':<10}")
+    print("-" * (88 if fid else 75))
 
     for sampler_name, num_steps, sampler_eta, active_modifiers in configs:
         base_sampler = "ddim" if "ddim" in sampler_name else "ddpm"
@@ -126,20 +161,55 @@ def run_benchmark(
         if device.type == "cuda":
             torch.cuda.synchronize(device)
 
-        start = time.perf_counter()
-        samples = pipeline.sample(
-            model=model,
-            shape=shape,
-            device=device,
-            num_inference_steps=num_steps if base_sampler != "ddpm" else None,
-            generator=generator,
-        )
-        if device.type == "cuda":
-            torch.cuda.synchronize(device)
-        elapsed = time.perf_counter() - start
+        fid_score = None
+        if fid:
+            evaluator = FIDEvaluator(device)
+            for r_batch in real_batches:
+                evaluator.update_real(r_batch)
 
-        sec_per_sample = elapsed / count
-        steps_per_sec = num_steps / elapsed
+            preview_batches = []
+            remaining_preview = count
+            remaining_fake = fid_samples
+
+            start = time.perf_counter()
+            while remaining_fake > 0:
+                batch_count = min(fid_batch_size, remaining_fake)
+                batch_shape = (batch_count, *sample_shape)
+                generated = pipeline.sample(
+                    model=model,
+                    shape=batch_shape,
+                    device=device,
+                    num_inference_steps=num_steps if base_sampler != "ddpm" else None,
+                    generator=generator,
+                )
+                if remaining_preview > 0:
+                    take = min(remaining_preview, batch_count)
+                    preview_batches.append(generated[:take].cpu())
+                    remaining_preview -= take
+                evaluator.update_fake(generated)
+                remaining_fake -= batch_count
+
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            elapsed = time.perf_counter() - start
+            fid_score = evaluator.compute()
+            samples = torch.cat(preview_batches, dim=0)
+            sec_per_sample = elapsed / fid_samples
+            steps_per_sec = (num_steps * fid_samples) / elapsed
+        else:
+            start = time.perf_counter()
+            samples = pipeline.sample(
+                model=model,
+                shape=shape,
+                device=device,
+                num_inference_steps=num_steps if base_sampler != "ddpm" else None,
+                generator=generator,
+            )
+            if device.type == "cuda":
+                torch.cuda.synchronize(device)
+            elapsed = time.perf_counter() - start
+            sec_per_sample = elapsed / count
+            steps_per_sec = num_steps / elapsed
 
         img_filename = f"{sampler_name}_{num_steps}steps.png" if samples.ndim == 4 else f"{sampler_name}_{num_steps}steps.pt"
         save_target = out_path / img_filename
@@ -148,23 +218,30 @@ def run_benchmark(
         else:
             torch.save(samples.cpu(), save_target)
 
-        results.append({
+        entry = {
             "sampler": sampler_name,
             "steps": num_steps,
             "count": count,
+            "fid_samples": fid_samples if fid else 0,
             "total_time_sec": round(elapsed, 4),
             "sec_per_sample": round(sec_per_sample, 4),
             "steps_per_sec": round(steps_per_sec, 2),
+            "fid": round(fid_score, 2) if fid_score is not None else "",
             "image_path": str(save_target),
-        })
+        }
+        results.append(entry)
 
-        print(f"{sampler_name:<10} | {num_steps:<8} | {elapsed:<15.2f} | {sec_per_sample:<12.4f} | {steps_per_sec:<10.2f}")
+        if fid:
+            print(f"{sampler_name:<10} | {num_steps:<8} | {elapsed:<15.2f} | {sec_per_sample:<12.4f} | {steps_per_sec:<10.2f} | {fid_score:<8.2f}")
+        else:
+            print(f"{sampler_name:<10} | {num_steps:<8} | {elapsed:<15.2f} | {sec_per_sample:<12.4f} | {steps_per_sec:<10.2f}")
 
-    print("=" * 75)
+    print("=" * (88 if fid else 75))
 
     # Save CSV
+    fieldnames = ["sampler", "steps", "count", "fid_samples", "total_time_sec", "sec_per_sample", "steps_per_sec", "fid", "image_path"]
     with open(csv_file, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["sampler", "steps", "count", "total_time_sec", "sec_per_sample", "steps_per_sec", "image_path"])
+        writer = csv.DictWriter(f, fieldnames=fieldnames)
         writer.writeheader()
         writer.writerows(results)
 
@@ -186,6 +263,13 @@ def main():
     parser.add_argument("--steps", nargs="+", type=int, default=[100, 50, 25, 10],
                         help="inference steps for DDIM (default: 100 50 25 10)")
     parser.add_argument("--eta", type=float, default=0.0, help="DDIM eta (default 0.0)")
+    parser.add_argument("--no-ddpm", action="store_true", help="skip full 1000-step DDPM to save time")
+    parser.add_argument("--fid", action="store_true", help="evaluate FID score against reference dataset")
+    parser.add_argument("--fid-samples", type=int, default=1000, help="number of real and generated images for FID")
+    parser.add_argument("--fid-batch-size", type=int, default=64, help="batch size for FID generation")
+    parser.add_argument("--fid-dataset", choices=("cifar10", "imagefolder"), default="cifar10")
+    parser.add_argument("--fid-data-dir", default="data", help="dataset root directory")
+    parser.add_argument("--fid-download", action="store_true", default=True, help="download reference data if needed")
     add_birth_death_ddpm_args(parser)
     args = parser.parse_args()
 
@@ -201,6 +285,13 @@ def main():
         steps_list=args.steps,
         eta=args.eta,
         bd_modifier=bd_modifier,
+        fid=args.fid,
+        fid_samples=args.fid_samples,
+        fid_batch_size=args.fid_batch_size,
+        fid_dataset=args.fid_dataset,
+        fid_data_dir=args.fid_data_dir,
+        fid_download=args.fid_download,
+        no_ddpm=args.no_ddpm,
     )
 
 

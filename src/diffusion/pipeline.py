@@ -27,9 +27,12 @@ class SamplingPipeline:
             timestep = int(timestep_tensor.item())
             previous = int(timesteps[index + 1].item()) if index + 1 < len(timesteps) else -1
             samples = self.sampler.step(model, samples, timestep, previous, self.scheduler, generator)
+            metadata = dict(self.sampler.sampling_metadata(timestep, previous, self.scheduler))
+            metadata.setdefault("step_idx", index)
+            metadata.setdefault("num_steps", len(timesteps))
             state = SamplingState(
                 samples, timestep, previous,
-                self.sampler.sampling_metadata(timestep, previous, self.scheduler),
+                metadata,
             )
             for modifier in self.modifiers:
                 state = modifier.apply(state, model=model, scheduler=self.scheduler, generator=generator)
