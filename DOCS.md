@@ -11,7 +11,7 @@ python3 train.py --dataset toy-images --toy-size 64 --image-size 16 --epochs 1 -
 
 # Framework guide
 
-This repository currently implements the first course-project deliverable: a standard diffusion training and sampling baseline. The code is split into components so that models, data sources, noise schedules, reverse samplers, and optional sampling-time methods can be extended independently.
+This repository implements the standard diffusion training and sampling baseline, plus an annealed Langevin sampler and an experimental, fixed-target birth-death particle update. The code is split so models, data sources, noise schedules, samplers, and optional sampling-time methods can be extended independently.
 
 ## Setup and running
 
@@ -96,7 +96,24 @@ Or compare a smaller number of DDIM model evaluations:
 python3 sample.py --checkpoint checkpoints/ddpm.pt --sampler ddim --steps 50 --eta 0 --seed 7
 ```
 
-The sample grid is saved under `samples/`. `--steps` selects inference steps for DDIM; DDPM uses every training timestep. Each run prints and saves a metrics JSON sidecar next to the sample output. For example, `samples/sample.png` produces `samples/sample.metrics.json`; set `--metrics-output path/to/run.json` to choose another location.
+The `annealed-langevin` sampler is also available for epsilon-prediction models:
+
+```bash
+python3 sample.py --checkpoint checkpoints/ddpm.pt --sampler annealed-langevin --steps 100 --langevin-steps-per-level 2 --count 16
+```
+
+Here `--steps` is the number of descending noise levels; NFE is that count multiplied by `--langevin-steps-per-level`. The per-level step size is `base_step_size * (sigma_t / sigma_min)^2`; the base parameter defaults to `1e-7`, so the effective step at high noise can be much larger. Tune it for the model and schedule in use. Annealed Langevin is an additional score-based sampler and is not the DDPM/DDIM reverse update.
+
+The fixed-noise `langevin` sampler is primarily provided for controlled target-density experiments. With an epsilon model it runs ULA against the model's score at one fixed noise level; it does not implement a conventional full image-generation trajectory. A small exact-score toy experiment can be run without training:
+
+```bash
+python3 sample.py --toy-mixture-oracle --sampler langevin --steps 1000 --count 256 --seed 7 --output samples/mixture-ula.pt
+python3 sample.py --toy-mixture-oracle --sampler langevin --steps 1000 --count 256 --birth-death --bd-kernel-bandwidth 0.3 --seed 7 --output samples/mixture-bd-ula.pt
+```
+
+These commands use an analytic eight-mode Gaussian mixture, a matching exact epsilon predictor, and the same fixed-noise ULA updates; the second inserts birth-death resampling after each update. See [DOCS-BD.md](DOCS-BD.md) for the implemented rates, assumptions, limitations, and details on what is faithful to the paper. Birth-death is deliberately rejected for learned image models and for DDPM, DDIM, or annealed Langevin: those paths do not expose a justified stationary target log density in the current framework.
+
+The sample grid is saved under `samples/`. `--steps` selects reverse updates for DDIM and fixed Langevin, and noise levels for annealed Langevin; DDPM uses every training timestep. Each run prints and saves a metrics JSON sidecar next to the sample output. For example, `samples/sample.png` produces `samples/sample.metrics.json`; set `--metrics-output path/to/run.json` to choose another location.
 
 The sampling metrics include:
 
@@ -126,6 +143,12 @@ Generate samples directly without first creating a local checkpoint:
 
 ```bash
 python3 sample.py --pretrained-model-id google/ddpm-cifar10-32 --sampler ddim --steps 50 --count 16 --seed 7
+```
+
+The same pretrained epsilon model can be used with annealed Langevin:
+
+```bash
+python3 sample.py --pretrained-model-id google/ddpm-cifar10-32 --sampler annealed-langevin --steps 100 --langevin-steps-per-level 2 --count 16 --seed 7
 ```
 
 Fine-tune the pretrained model with the ordinary training pipeline:
@@ -158,9 +181,10 @@ src/diffusion/
   models/                     Denoiser interface, image U-Net, vector MLP, pretrained adapter
   datasets/                   Data-module interface, CIFAR-10, ImageFolder, toy data
   schedulers/                 NoiseScheduler interface, linear, cosine, pretrained
-  samplers/                   Sampler interface, DDPM and DDIM reverse updates
+  samplers/                   Sampler interface, DDPM, DDIM, ULA, and annealed Langevin
   metrics/                    Sampling NFE, timing, throughput, optional FID, and JSON output
-  acceleration/               SamplingModifier interface and birth-death placeholder
+  targets/                    Log-density/score interface and analytic toy mixture
+  acceleration/               SamplingModifier interface and KDE birth-death update
   pipeline.py                 Sampling loop; composes sampler and modifiers
   engine.py                   Training epoch and checkpoint helpers
   cli.py                      Argument handling for the two root scripts
@@ -169,11 +193,10 @@ src/diffusion/
 - **Model:** subclass `DiffusionModel` and add it to `models.make_model` to make an architecture available by name. Its name can then be passed as `--model`. The current choices include an image U-Net, a vector MLP, and the optional pretrained Diffusers adapter.
 - **Dataset:** subclass `DiffusionDataModule` and add it to `datasets.make_data_module`. A dataset should yield a tensor or `(tensor, label)` pair and expose `sample_shape`; image tensors should be normalized to `[-1, 1]`. The same interface supports image-shaped and vector-shaped data.
 - **Scheduler:** subclass `NoiseScheduler`, implement `make_betas`, and register it in `schedulers.make_scheduler`. It supplies the forward noising process and coefficients consumed by reverse updates. The pretrained adapter imports betas from the model repository's Diffusers scheduler configuration.
-- **Sampler:** subclass `Sampler`, implement `inference_timesteps` and one `step` update, then register it in `samplers.make_sampler`. The pipeline handles model evaluation order and iteration. Its name can then be passed as `--sampler`.
+- **Sampler:** subclass `Sampler`, implement `inference_timesteps` and one `step` update, then register it in `samplers.make_sampler`. Override `initial_samples` for sampler-specific initialization and `sampling_metadata` to share update information with modifiers. The pipeline handles model evaluation order and iteration. Its name can then be passed as `--sampler`.
 - **Sampling modifier:** subclass `SamplingModifier` and attach it to a `SamplingPipeline`. The pipeline applies modifiers after each sampler update during generation. A modifier can change the sample population size and does not participate in training.
+- **Target distribution:** implement `TargetDistribution.log_prob` and `.score` for a stationary target on the sampler's state coordinates. The target interface is currently used by birth-death, which needs density values in addition to score estimates.
 
-## Birth-death direction
+## Birth-death implementation scope
 
-The cited [Lu, Lu, and Nolen paper](https://arxiv.org/abs/1905.09863) augments Langevin dynamics with a nonlocal birth-death term for a population of samples. That supports keeping birth-death logic separate from the learned denoiser and training objective, and treating it as a sampling-time population modifier. The paper itself does not specify how to skip DDPM denoising steps. Applying its idea to a diffusion trajectory therefore requires a project-specific rule for the time-dependent noisy distributions and particle scores; that research and implementation are future deliverables.
-
-`src/diffusion/acceleration/birth_death.py` contains only the placeholder class. The currently usable pipeline has no modifier enabled by default, so baseline DDPM and DDIM behavior is unaffected. A future modifier can be passed to `SamplingPipeline(..., modifiers=[...])` without changing either sampler's reverse-update implementation. Training code never invokes sampling modifiers.
+The birth-death method now runs as an optional `SamplingModifier` after fixed-target Langevin updates. The CLI currently exposes it only with the exact toy-mixture oracle because the method requires target log densities; a learned DDPM epsilon predictor supplies a score estimate but not `log p_t(x)`. For the equations, discrete event rule, and known limitations, see [DOCS-BD.md](DOCS-BD.md). It changes particle ancestry while preserving the population size; this implementation does not remove Langevin time steps from a trajectory. Standard DDPM/DDIM remain unchanged when the modifier is absent, and training never invokes it.

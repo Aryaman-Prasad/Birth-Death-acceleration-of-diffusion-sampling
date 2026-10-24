@@ -9,12 +9,14 @@ from torchvision.utils import save_image
 from torch.utils.data import DataLoader
 
 from diffusion.datasets import make_data_module
+from diffusion.acceleration.birth_death import BirthDeathAcceleration
 from diffusion.engine import load_checkpoint, save_checkpoint, train_epoch
 from diffusion.metrics import FIDEvaluator, SamplingMetrics, measure_sampling, write_metrics
 from diffusion.models import make_model
 from diffusion.pipeline import SamplingPipeline
 from diffusion.samplers import make_sampler
 from diffusion.schedulers import make_scheduler
+from diffusion.targets import ToyGaussianMixtureTarget
 
 
 DEFAULT_PRETRAINED_MODEL = "google/ddpm-cifar10-32"
@@ -225,18 +227,35 @@ def sample_main(argv=None):
     source.add_argument("--checkpoint", default=None, help="local framework checkpoint")
     source.add_argument("--pretrained-model-id", default=None,
                         help=f"sample directly from a Diffusers repository, e.g. {DEFAULT_PRETRAINED_MODEL}")
+    source.add_argument("--toy-mixture-oracle", action="store_true",
+                        help="use the exact score model for the analytic 2D Gaussian-mixture target")
     parser.add_argument("--pretrained-revision", default=None)
     parser.add_argument("--pretrained-unet-subfolder", default=None)
     parser.add_argument("--pretrained-scheduler-subfolder", default=None)
     parser.add_argument("--scheduler", default="auto",
-                        help="auto (repository schedule), linear, or cosine for direct pretrained sampling")
+                        help="auto, linear, cosine, or huggingface for direct pretrained sampling")
     parser.add_argument("--timesteps", type=int, default=1000)
     parser.add_argument("--beta-start", type=float, default=1e-4)
     parser.add_argument("--beta-end", type=float, default=2e-2)
-    parser.add_argument("--sampler", default="ddpm")
+    parser.add_argument("--sampler", default="ddpm",
+                        help="ddpm, ddim, annealed-langevin, or fixed-target langevin")
     parser.add_argument("--steps", type=int, default=None,
-                        help="inference steps; DDIM can use fewer than training timesteps")
+                        help="DDIM steps, Langevin iterations, or annealed Langevin noise levels")
     parser.add_argument("--eta", type=float, default=0.0, help="DDIM stochasticity; zero is deterministic")
+    parser.add_argument("--langevin-step-size", type=float, default=None,
+                        help="Langevin base step size (defaults depend on sampler)")
+    parser.add_argument("--langevin-steps-per-level", type=int, default=1,
+                        help="ULA updates at each noise level for annealed-langevin")
+    parser.add_argument("--langevin-timestep", type=int, default=0,
+                        help="fixed DDPM noise level for the langevin sampler")
+    parser.add_argument("--langevin-initial-scale", type=float, default=1.0,
+                        help="initial Gaussian scale for fixed-target langevin")
+    parser.add_argument("--birth-death", action="store_true",
+                        help="enable fixed-population birth-death after each fixed-target ULA update")
+    parser.add_argument("--bd-kernel-bandwidth", type=float, default=0.3,
+                        help="Gaussian KDE bandwidth for birth-death particle rates")
+    parser.add_argument("--toy-mixture-radius", type=float, default=2.0)
+    parser.add_argument("--toy-mixture-standard-deviation", type=float, default=0.15)
     parser.add_argument("--count", type=int, default=16)
     parser.add_argument("--nrow", type=int, default=4)
     parser.add_argument("--seed", type=int, default=None)
@@ -260,10 +279,25 @@ def sample_main(argv=None):
     args = parser.parse_args(argv)
 
     device = _device(args.device)
+    target = None
     if args.checkpoint:
         model, scheduler, config, _ = load_checkpoint(args.checkpoint, device)
         sample_shape = tuple(config.get("sample_shape", (config["channels"],
                               config["image_size"], config["image_size"])))
+    elif args.toy_mixture_oracle:
+        scheduler_name = "linear" if args.scheduler == "auto" else args.scheduler
+        if scheduler_name == "huggingface":
+            raise ValueError("the toy-mixture oracle requires a local linear or cosine scheduler")
+        scheduler = make_scheduler(scheduler_name, args.timesteps, args.beta_start,
+                                   args.beta_end).to(device)
+        target = ToyGaussianMixtureTarget(
+            radius=args.toy_mixture_radius,
+            standard_deviation=args.toy_mixture_standard_deviation,
+        )
+        model = make_model(
+            "toy-mixture-oracle", target=target, alpha_bars=scheduler.alpha_bars
+        ).to(device)
+        sample_shape = (2,)
     else:
         model_id = args.pretrained_model_id or DEFAULT_PRETRAINED_MODEL
         model = make_model("huggingface-unet", pretrained_model_id=model_id,
@@ -275,8 +309,24 @@ def sample_main(argv=None):
                                    args.pretrained_scheduler_subfolder).to(device)
         sample_shape = tuple(model.sample_shape)
     model.eval()
-    sampler = make_sampler(args.sampler, args.eta)
-    pipeline = SamplingPipeline(sampler, scheduler)
+    sampler = make_sampler(
+        args.sampler,
+        args.eta,
+        langevin_step_size=args.langevin_step_size,
+        langevin_steps_per_level=args.langevin_steps_per_level,
+        langevin_timestep=args.langevin_timestep,
+        langevin_initial_scale=args.langevin_initial_scale,
+    )
+    modifiers = []
+    if args.birth_death:
+        if target is None or not args.toy_mixture_oracle:
+            raise ValueError("--birth-death currently requires --toy-mixture-oracle with its known target density")
+        if args.sampler not in {"langevin", "ula"}:
+            raise ValueError("--birth-death currently supports only the fixed-target --sampler langevin")
+        if args.count < 2:
+            raise ValueError("--birth-death requires --count of at least 2")
+        modifiers.append(BirthDeathAcceleration(target, args.bd_kernel_bandwidth))
+    pipeline = SamplingPipeline(sampler, scheduler, modifiers=modifiers)
     generator = torch.Generator(device=device).manual_seed(args.seed) if args.seed is not None else None
     sampler_steps = len(sampler.inference_timesteps(scheduler, args.steps, device))
     fid_score = None
@@ -303,8 +353,11 @@ def sample_main(argv=None):
     metrics_path = Path(args.metrics_output) if args.metrics_output else output.with_name(
         f"{output.stem}.metrics.json"
     )
-    model_source = (f"checkpoint:{args.checkpoint}" if args.checkpoint else
-                    f"huggingface:{args.pretrained_model_id or DEFAULT_PRETRAINED_MODEL}")
+    model_source = (
+        f"checkpoint:{args.checkpoint}" if args.checkpoint else
+        "toy-mixture-oracle" if args.toy_mixture_oracle else
+        f"huggingface:{args.pretrained_model_id or DEFAULT_PRETRAINED_MODEL}"
+    )
     metadata = {
         "model_source": model_source,
         "sampler": args.sampler,
@@ -313,7 +366,21 @@ def sample_main(argv=None):
         "sample_shape": list(sample_shape),
         "sample_output": str(output),
         "saved_preview_count": int(samples.shape[0]),
+        "scheduler": type(scheduler).__name__,
+        "birth_death_enabled": args.birth_death,
     }
+    if args.sampler in {"langevin", "ula", "annealed-langevin", "ald"}:
+        metadata.update({
+            "langevin_step_size": sampler.step_size,
+            "langevin_steps_per_level": getattr(sampler, "steps_per_level", None),
+            "langevin_fixed_timestep": getattr(sampler, "timestep", None),
+        })
+    if args.birth_death:
+        metadata.update({
+            "birth_death_kernel_bandwidth": args.bd_kernel_bandwidth,
+            "toy_mixture_radius": args.toy_mixture_radius,
+            "toy_mixture_standard_deviation": args.toy_mixture_standard_deviation,
+        })
     additional_metrics = None
     if args.fid:
         metadata.update({

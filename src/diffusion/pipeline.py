@@ -22,13 +22,18 @@ class SamplingPipeline:
         model.eval()
         self.scheduler.to(device)
         timesteps = self.sampler.inference_timesteps(self.scheduler, num_inference_steps, device)
-        samples = torch.randn(shape, device=device, generator=generator)
+        samples = self.sampler.initial_samples(shape, device, self.scheduler, timesteps, generator)
         for index, timestep_tensor in enumerate(timesteps):
             timestep = int(timestep_tensor.item())
             previous = int(timesteps[index + 1].item()) if index + 1 < len(timesteps) else -1
             samples = self.sampler.step(model, samples, timestep, previous, self.scheduler, generator)
-            state = SamplingState(samples, timestep, previous)
+            state = SamplingState(
+                samples, timestep, previous,
+                self.sampler.sampling_metadata(timestep, previous, self.scheduler),
+            )
             for modifier in self.modifiers:
                 state = modifier.apply(state, model=model, scheduler=self.scheduler, generator=generator)
             samples = state.samples
-        return samples.clamp(-1, 1)
+        # Images in the framework are represented in [-1, 1]. Vector targets
+        # (including the toy mixture) have their own meaningful coordinates.
+        return samples.clamp(-1, 1) if samples.ndim == 4 else samples

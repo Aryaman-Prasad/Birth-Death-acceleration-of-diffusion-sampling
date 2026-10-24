@@ -3,6 +3,7 @@
 from diffusion.models.base import DiffusionModel
 from diffusion.models.huggingface import HuggingFaceUNetModel
 from diffusion.models.toy_mlp import ToyMLP
+from diffusion.models.toy_mixture_oracle import ToyMixtureOracleModel
 from diffusion.models.unet import SimpleUNet
 
 
@@ -11,9 +12,12 @@ def make_model(name: str, **kwargs) -> DiffusionModel:
         return SimpleUNet(**kwargs)
     if name == "toy-mlp":
         return ToyMLP(**kwargs)
+    if name == "toy-mixture-oracle":
+        return ToyMixtureOracleModel(**kwargs)
     if name in {"huggingface-unet", "hf-unet"}:
         return HuggingFaceUNetModel(**kwargs)
     raise ValueError(f"Unknown model: {name}")
 
 
-__all__ = ["DiffusionModel", "SimpleUNet", "ToyMLP", "HuggingFaceUNetModel", "make_model"]
+__all__ = ["DiffusionModel", "SimpleUNet", "ToyMLP", "ToyMixtureOracleModel",
+           "HuggingFaceUNetModel", "make_model"]
