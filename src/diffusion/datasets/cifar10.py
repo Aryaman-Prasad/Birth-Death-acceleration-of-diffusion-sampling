@@ -8,10 +8,12 @@ from diffusion.datasets.base import DiffusionDataModule
 
 
 class CIFAR10DataModule(DiffusionDataModule):
-    def __init__(self, data_dir: str, image_size: int, download: bool = False):
+    def __init__(self, data_dir: str, image_size: int, download: bool = False,
+                 train: bool = True):
         self.data_dir = Path(data_dir)
         self.image_size = image_size
         self.download = download
+        self.train = train
         self.transform = transforms.Compose([
             transforms.Resize(image_size), transforms.CenterCrop(image_size), transforms.ToTensor(),
             transforms.Normalize((0.5, 0.5, 0.5), (0.5, 0.5, 0.5)),
@@ -22,4 +24,5 @@ class CIFAR10DataModule(DiffusionDataModule):
         return (3, self.image_size, self.image_size)
 
     def dataset(self):
-        return datasets.CIFAR10(self.data_dir, train=True, download=self.download, transform=self.transform)
+        return datasets.CIFAR10(self.data_dir, train=self.train, download=self.download,
+                                transform=self.transform)

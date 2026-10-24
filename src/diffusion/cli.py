@@ -2,14 +2,15 @@
 
 import argparse
 import math
-import time
 from pathlib import Path
 
 import torch
 from torchvision.utils import save_image
+from torch.utils.data import DataLoader
 
 from diffusion.datasets import make_data_module
 from diffusion.engine import load_checkpoint, save_checkpoint, train_epoch
+from diffusion.metrics import FIDEvaluator, SamplingMetrics, measure_sampling, write_metrics
 from diffusion.models import make_model
 from diffusion.pipeline import SamplingPipeline
 from diffusion.samplers import make_sampler
@@ -46,6 +47,95 @@ def _model_configuration(name: str, sample_shape: tuple[int, ...], base_channels
     else:
         raise ValueError(f"Unknown model: {name}")
     return name, model_args
+
+
+def _sample_with_fid(model, pipeline, sample_shape, device, args, sampler_steps, generator):
+    """Stream an FID-sized generated set while retaining only the preview grid."""
+    if len(sample_shape) != 3 or sample_shape[0] != 3:
+        raise ValueError("FID is available only for RGB image models")
+    if args.count < 1 or args.fid_samples < 2 or args.fid_batch_size < 1:
+        raise ValueError("--count and --fid-batch-size must be positive; --fid-samples must be at least 2")
+    if args.fid_samples < args.count:
+        raise ValueError("--fid-samples must be at least --count so the saved preview comes from the FID run")
+
+    evaluator = FIDEvaluator(device)
+    reference_module = make_data_module(
+        args.fid_dataset, args.fid_data_dir, sample_shape[-1], args.fid_download,
+        train=False,
+    )
+    if tuple(reference_module.sample_shape) != sample_shape:
+        raise ValueError(
+            f"FID reference shape {reference_module.sample_shape} does not match "
+            f"generated image shape {sample_shape}"
+        )
+    reference_dataset = reference_module.dataset()
+    if len(reference_dataset) < args.fid_samples:
+        raise ValueError(
+            f"FID requested {args.fid_samples} real images, but the reference dataset "
+            f"contains only {len(reference_dataset)}"
+        )
+    reference_generator = (torch.Generator().manual_seed(args.seed)
+                           if args.seed is not None else None)
+    reference_loader = DataLoader(
+        reference_dataset,
+        batch_size=args.fid_batch_size,
+        shuffle=True,
+        num_workers=args.fid_num_workers,
+        pin_memory=device.type == "cuda",
+        generator=reference_generator,
+    )
+
+    remaining = args.fid_samples
+    for batch in reference_loader:
+        images = batch[0] if isinstance(batch, (tuple, list)) else batch
+        take = min(remaining, images.shape[0])
+        evaluator.update_real(images[:take])
+        remaining -= take
+        if remaining == 0:
+            break
+
+    preview_batches = []
+    remaining_preview = args.count
+    remaining_fake = args.fid_samples
+    total_nfe = 0
+    total_forward_calls = 0
+    sampling_seconds = 0.0
+    sampling_batches = 0
+    while remaining_fake:
+        batch_count = min(args.fid_batch_size, remaining_fake)
+        shape = (batch_count, *sample_shape)
+        generated, batch_metrics = measure_sampling(
+            model, device, batch_count, sampler_steps,
+            lambda shape=shape: pipeline.sample(
+                model, shape, device, args.steps, generator
+            ),
+        )
+        total_nfe += batch_metrics.nfe
+        total_forward_calls += batch_metrics.model_forward_calls
+        sampling_seconds += batch_metrics.elapsed_seconds
+        sampling_batches += 1
+
+        preview_count = min(remaining_preview, batch_count)
+        if preview_count:
+            preview_batches.append(generated[:preview_count].cpu())
+            remaining_preview -= preview_count
+        evaluator.update_fake(generated)
+        remaining_fake -= batch_count
+
+    fid_score = evaluator.compute()
+    # NFE is reported per generated sampling batch/trajectory. The total number
+    # of actual model invocations across all chunks is recorded separately.
+    average_nfe = round(total_nfe / sampling_batches) if sampling_batches else 0
+    metrics = SamplingMetrics(
+        nfe=average_nfe,
+        sampler_steps=sampler_steps,
+        sample_count=args.fid_samples,
+        elapsed_seconds=sampling_seconds,
+        model_forward_calls=total_forward_calls,
+        sampling_batches=sampling_batches,
+    )
+    samples = torch.cat(preview_batches, dim=0)
+    return samples, metrics, fid_score, evaluator.elapsed_seconds
 
 
 def train_main(argv=None):
@@ -151,6 +241,21 @@ def sample_main(argv=None):
     parser.add_argument("--nrow", type=int, default=4)
     parser.add_argument("--seed", type=int, default=None)
     parser.add_argument("--output", default=None, help="defaults to a PNG grid for images or a PT tensor for vectors")
+    parser.add_argument("--metrics-output", default=None,
+                        help="metrics JSON path (defaults to a sidecar next to --output)")
+    parser.add_argument("--fid", action="store_true",
+                        help="also compute FID against a real image reference dataset")
+    parser.add_argument("--fid-dataset", choices=("cifar10", "imagefolder"), default="cifar10")
+    parser.add_argument("--fid-data-dir", default="data",
+                        help="dataset root used for FID reference images")
+    parser.add_argument("--fid-download", action="store_true",
+                        help="download the CIFAR-10 reference split if needed")
+    parser.add_argument("--fid-samples", type=int, default=10000,
+                        help="number of real and generated images used for FID")
+    parser.add_argument("--fid-batch-size", type=int, default=64,
+                        help="streaming batch size for FID reference and generated images")
+    parser.add_argument("--fid-num-workers", type=int, default=0,
+                        help="data-loader workers for FID reference images")
     parser.add_argument("--device", default="auto")
     args = parser.parse_args(argv)
 
@@ -173,12 +278,19 @@ def sample_main(argv=None):
     sampler = make_sampler(args.sampler, args.eta)
     pipeline = SamplingPipeline(sampler, scheduler)
     generator = torch.Generator(device=device).manual_seed(args.seed) if args.seed is not None else None
-    shape = (args.count, *sample_shape)
-    start = time.perf_counter()
-    samples = pipeline.sample(model, shape, device, args.steps, generator)
-    if device.type == "cuda":
-        torch.cuda.synchronize(device)
-    elapsed = time.perf_counter() - start
+    sampler_steps = len(sampler.inference_timesteps(scheduler, args.steps, device))
+    fid_score = None
+    fid_seconds = None
+    if args.fid:
+        samples, metrics, fid_score, fid_seconds = _sample_with_fid(
+            model, pipeline, sample_shape, device, args, sampler_steps, generator
+        )
+    else:
+        shape = (args.count, *sample_shape)
+        samples, metrics = measure_sampling(
+            model, device, args.count, sampler_steps,
+            lambda: pipeline.sample(model, shape, device, args.steps, generator),
+        )
 
     output = Path(args.output) if args.output else Path(
         "samples/sample.png" if samples.ndim == 4 else "samples/samples.pt"
@@ -188,5 +300,42 @@ def sample_main(argv=None):
         save_image((samples + 1) / 2, output, nrow=args.nrow)
     else:
         torch.save(samples.cpu(), output)
-    print(f"saved {samples.shape[0]} samples to {output}; sampler={args.sampler}; "
-          f"steps={args.steps or scheduler.num_train_timesteps}; seconds={elapsed:.2f}")
+    metrics_path = Path(args.metrics_output) if args.metrics_output else output.with_name(
+        f"{output.stem}.metrics.json"
+    )
+    model_source = (f"checkpoint:{args.checkpoint}" if args.checkpoint else
+                    f"huggingface:{args.pretrained_model_id or DEFAULT_PRETRAINED_MODEL}")
+    metadata = {
+        "model_source": model_source,
+        "sampler": args.sampler,
+        "device": str(device),
+        "seed": args.seed,
+        "sample_shape": list(sample_shape),
+        "sample_output": str(output),
+        "saved_preview_count": int(samples.shape[0]),
+    }
+    additional_metrics = None
+    if args.fid:
+        metadata.update({
+            "fid_reference_dataset": args.fid_dataset,
+            "fid_reference_data_dir": args.fid_data_dir,
+            "fid_reference_split": "test" if args.fid_dataset == "cifar10" else "all",
+            "fid_samples": args.fid_samples,
+            "fid_batch_size": args.fid_batch_size,
+            "fid_num_workers": args.fid_num_workers,
+            "fid_feature_dimension": 2048,
+        })
+        additional_metrics = {
+            "fid": fid_score,
+            "fid_evaluation_seconds": fid_seconds,
+        }
+    write_metrics(metrics_path, metrics, metadata, additional_metrics)
+    print(f"saved {samples.shape[0]} samples to {output}")
+    print(f"sampler={args.sampler} | steps={metrics.sampler_steps} | NFE={metrics.nfe} | "
+          f"model_forward_calls={metrics.model_forward_calls} | "
+          f"time={metrics.elapsed_seconds:.2f}s | "
+          f"throughput={metrics.samples_per_second:.2f} samples/s")
+    if args.fid:
+        print(f"FID-2048={fid_score:.4f} | samples={args.fid_samples} | "
+              f"reference={args.fid_dataset} | evaluation_time={fid_seconds:.2f}s")
+    print(f"saved sampling metrics to {metrics_path}")

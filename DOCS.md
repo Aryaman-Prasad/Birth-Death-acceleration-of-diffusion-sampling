@@ -29,6 +29,12 @@ For optional pretrained Hugging Face Diffusers models, install the `pretrained` 
 python3 -m pip install -e ".[pretrained]"
 ```
 
+For optional FID evaluation, install the `fid` extra:
+
+```bash
+python3 -m pip install -e ".[fid]"
+```
+
 On Windows, use `py -3 -m pip install -e .` if `python3` is not on PATH. After installation, run the root-level scripts directly. They add `src/` to the import path, so no separate CLI command is required.
 
 ### Train on CIFAR-10
@@ -90,7 +96,27 @@ Or compare a smaller number of DDIM model evaluations:
 python3 sample.py --checkpoint checkpoints/ddpm.pt --sampler ddim --steps 50 --eta 0 --seed 7
 ```
 
-The sample grid is saved under `samples/`. `--steps` selects inference steps for DDIM; DDPM uses every training timestep. Sampling reports wall-clock time. For comparisons, keep the checkpoint, sample count, device, and seed fixed and repeat timings. The project currently reports training noise-prediction MSE and sampling time; FID and other image-quality metrics are not implemented yet.
+The sample grid is saved under `samples/`. `--steps` selects inference steps for DDIM; DDPM uses every training timestep. Each run prints and saves a metrics JSON sidecar next to the sample output. For example, `samples/sample.png` produces `samples/sample.metrics.json`; set `--metrics-output path/to/run.json` to choose another location.
+
+The sampling metrics include:
+
+- **NFE:** model evaluations per generated sampling batch/trajectory. For standard DDPM and DDIM, this matches the sampler step count. Calls made by sampling-time modifiers are counted too.
+- **Model forward calls:** the total observed denoiser invocations. This equals NFE for an ordinary single-batch run; with FID's streamed generation, it covers all batches.
+- **Sampler steps:** the number of reverse updates selected for this run.
+- **Elapsed time:** wall-clock duration of the sampling call, with CUDA synchronized before and after measurement when running on a CUDA device.
+- **Throughput:** generated samples per second, plus seconds per sample and model calls per second.
+
+These measurements add no model evaluations and do not change generated samples. For fair speed comparisons, use the same checkpoint, sample count, device, and seed, and repeat runs to account for warm-up and device load. NFE is useful for comparing algorithmic work independently from hardware speed.
+
+FID is optional because it adds an Inception feature-extraction pass and needs a real image reference set. Install the `fid` extra above, then opt in when sampling. If sampling a Hugging Face model, install both extras with `python3 -m pip install -e ".[pretrained,fid]"`. For a pretrained CIFAR-10 model, the following uses CIFAR-10's test split and generates 10,000 images in batches of 64:
+
+```bash
+python3 sample.py --pretrained-model-id google/ddpm-cifar10-32 --sampler ddim --steps 50 --count 16 --fid --fid-dataset cifar10 --fid-data-dir data --fid-download
+```
+
+The ordinary `--count` still controls the saved preview grid. `--fid-samples` controls the number of generated and real images used for the score (default `10000`), and `--fid-batch-size` controls streaming memory use. The command saves only the first `--count` generated images but evaluates FID over the full set. For an ImageFolder reference set, pass `--fid-dataset imagefolder --fid-data-dir data/my-images`; the directory must contain class subfolders. Set `--fid-samples` no higher than the number of available reference images. FID requires RGB image models and uses feature dimension 2048. Its evaluation time is reported separately from diffusion sampling time. The JSON sidecar includes the FID score and reference configuration.
+
+FID compares Inception feature statistics for real and generated images and is sensitive to sample count and preprocessing. Use the same reference split, number of samples, and image resolution when comparing runs. Tiny sample sets or procedural toy images do not provide a meaningful image-quality benchmark. TorchMetrics expects normalized RGB images and its default Inception feature extractor uses the optional `torch-fidelity` dependency; see the [TorchMetrics FID documentation](https://lightning.ai/docs/torchmetrics/stable/image/frechet_inception_distance.html).
 
 ### Use a pretrained Diffusers model
 
@@ -133,6 +159,7 @@ src/diffusion/
   datasets/                   Data-module interface, CIFAR-10, ImageFolder, toy data
   schedulers/                 NoiseScheduler interface, linear, cosine, pretrained
   samplers/                   Sampler interface, DDPM and DDIM reverse updates
+  metrics/                    Sampling NFE, timing, throughput, optional FID, and JSON output
   acceleration/               SamplingModifier interface and birth-death placeholder
   pipeline.py                 Sampling loop; composes sampler and modifiers
   engine.py                   Training epoch and checkpoint helpers

@@ -8,9 +8,9 @@ from diffusion.datasets.toy_mixture import ToyGaussianMixtureDataModule
 
 
 def make_data_module(name: str, data_dir: str, image_size: int, download: bool = False,
-                     toy_size: int = 512, seed: int = 0):
+                     toy_size: int = 512, seed: int = 0, train: bool = True):
     if name.lower() == "cifar10":
-        return CIFAR10DataModule(data_dir, image_size, download)
+        return CIFAR10DataModule(data_dir, image_size, download, train)
     if name.lower() in {"imagefolder", "image-folder"}:
         return ImageFolderDataModule(data_dir, image_size)
     if name.lower() == "toy-images":
