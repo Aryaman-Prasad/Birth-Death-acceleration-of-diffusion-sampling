@@ -10,6 +10,10 @@ from torch.utils.data import DataLoader
 
 from diffusion.datasets import make_data_module
 from diffusion.acceleration.birth_death import BirthDeathAcceleration
+from diffusion.acceleration.birth_death_ddpm import (
+    add_birth_death_ddpm_args,
+    create_birth_death_ddpm_from_args,
+)
 from diffusion.engine import load_checkpoint, save_checkpoint, train_epoch
 from diffusion.metrics import FIDEvaluator, SamplingMetrics, measure_sampling, write_metrics
 from diffusion.models import make_model
@@ -276,6 +280,7 @@ def sample_main(argv=None):
     parser.add_argument("--fid-num-workers", type=int, default=0,
                         help="data-loader workers for FID reference images")
     parser.add_argument("--device", default="auto")
+    add_birth_death_ddpm_args(parser)
     args = parser.parse_args(argv)
 
     device = _device(args.device)
@@ -326,6 +331,13 @@ def sample_main(argv=None):
         if args.count < 2:
             raise ValueError("--birth-death requires --count of at least 2")
         modifiers.append(BirthDeathAcceleration(target, args.bd_kernel_bandwidth))
+    if getattr(args, "birth_death_ddpm", False):
+        if args.count < 2:
+            raise ValueError("--birth-death-ddpm requires --count of at least 2")
+        target_eval = None
+        if target is not None and hasattr(target, "log_prob_at_noise"):
+            target_eval = lambda x, sigma: target.log_prob_at_noise(x, sigma)
+        modifiers.append(create_birth_death_ddpm_from_args(args, target_evaluator=target_eval))
     pipeline = SamplingPipeline(sampler, scheduler, modifiers=modifiers)
     generator = torch.Generator(device=device).manual_seed(args.seed) if args.seed is not None else None
     sampler_steps = len(sampler.inference_timesteps(scheduler, args.steps, device))
@@ -368,7 +380,14 @@ def sample_main(argv=None):
         "saved_preview_count": int(samples.shape[0]),
         "scheduler": type(scheduler).__name__,
         "birth_death_enabled": args.birth_death,
+        "birth_death_ddpm_enabled": getattr(args, "birth_death_ddpm", False),
     }
+    if getattr(args, "birth_death_ddpm", False):
+        metadata.update({
+            "bd_ddpm_strength": args.bd_ddpm_strength,
+            "bd_ddpm_jitter": args.bd_ddpm_jitter,
+            "bd_ddpm_mode": args.bd_ddpm_mode,
+        })
     if args.sampler in {"langevin", "ula", "annealed-langevin", "ald"}:
         metadata.update({
             "langevin_step_size": sampler.step_size,

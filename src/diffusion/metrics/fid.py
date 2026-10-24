@@ -41,9 +41,7 @@ class FIDEvaluator:
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)
         start = time.perf_counter()
-        images = ((images.detach().clamp(-1, 1) + 1) / 2).to(
-            device=self.device, dtype=torch.float32, non_blocking=True
-        )
+        images = ((images.detach().clamp(-1, 1) + 1) / 2).to(device=self.device, dtype=torch.float32, non_blocking=True)
         self.metric.update(images, real=real)
         if self.device.type == "cuda":
             torch.cuda.synchronize(self.device)

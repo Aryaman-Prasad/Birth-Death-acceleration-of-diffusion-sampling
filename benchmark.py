@@ -1,16 +1,24 @@
 """Benchmark baseline diffusion samplers and collect quality and inference time data."""
 
+from __future__ import annotations
+
 import argparse
 import csv
 import sys
 import time
 from pathlib import Path
+from typing import Any
 
 import torch
 from torchvision.utils import save_image
 
 sys.path.insert(0, str(Path(__file__).resolve().parent / "src"))
 
+from diffusion.acceleration import (
+    BirthDeathDDPM,
+    add_birth_death_ddpm_args,
+    create_birth_death_ddpm_from_args,
+)
 from diffusion.cli import DEFAULT_PRETRAINED_MODEL, _device
 from diffusion.engine import load_checkpoint
 from diffusion.models import make_model
@@ -48,6 +56,7 @@ def run_benchmark(
     output_dir: str = "baseline_data",
     steps_list: list[int] | None = None,
     eta: float = 0.0,
+    bd_modifier: Any = None,
 ):
     out_path = Path(output_dir)
     out_path.mkdir(parents=True, exist_ok=True)
@@ -59,6 +68,7 @@ def run_benchmark(
         print(f"Loading checkpoint from {checkpoint}...")
         model, scheduler, config, _ = load_checkpoint(checkpoint, device)
         sample_shape = _get_sample_shape(model, config)
+    else:
         model_id = pretrained_model_id or DEFAULT_PRETRAINED_MODEL
         print(f"Loading pretrained model: {model_id}...")
         model = make_model(
@@ -88,10 +98,12 @@ def run_benchmark(
     if steps_list is None:
         steps_list = [100, 50, 25, 10]
 
-    configs = [("ddpm", train_timesteps, 0.0)]
+    configs = [("ddpm", train_timesteps, 0.0, None)]
     for s in steps_list:
         if s < train_timesteps:
-            configs.append(("ddim", s, eta))
+            configs.append(("ddim", s, eta, None))
+            if bd_modifier is not None:
+                configs.append(("ddim+bd", s, eta, [bd_modifier]))
 
     results = []
     csv_file = out_path / "benchmark_results.csv"
@@ -100,9 +112,14 @@ def run_benchmark(
     print(f"{'Sampler':<10} | {'Steps':<8} | {'Total Time (s)':<15} | {'Sec/Sample':<12} | {'Steps/Sec':<10}")
     print("-" * 75)
 
-    for sampler_name, num_steps, sampler_eta in configs:
-        sampler = make_sampler(sampler_name, sampler_eta)
-        pipeline = SamplingPipeline(sampler, scheduler)
+    for sampler_name, num_steps, sampler_eta, active_modifiers in configs:
+        base_sampler = "ddim" if "ddim" in sampler_name else "ddpm"
+        sampler = make_sampler(base_sampler, sampler_eta)
+        if active_modifiers:
+            for m in active_modifiers:
+                if hasattr(m, "reset"):
+                    m.reset()
+        pipeline = SamplingPipeline(sampler, scheduler, modifiers=active_modifiers)
         generator = torch.Generator(device=device).manual_seed(seed)
 
         # Warmup if CUDA
@@ -114,7 +131,7 @@ def run_benchmark(
             model=model,
             shape=shape,
             device=device,
-            num_inference_steps=num_steps if sampler_name != "ddpm" else None,
+            num_inference_steps=num_steps if base_sampler != "ddpm" else None,
             generator=generator,
         )
         if device.type == "cuda":
@@ -169,7 +186,10 @@ def main():
     parser.add_argument("--steps", nargs="+", type=int, default=[100, 50, 25, 10],
                         help="inference steps for DDIM (default: 100 50 25 10)")
     parser.add_argument("--eta", type=float, default=0.0, help="DDIM eta (default 0.0)")
+    add_birth_death_ddpm_args(parser)
     args = parser.parse_args()
+
+    bd_modifier = create_birth_death_ddpm_from_args(args)
 
     run_benchmark(
         checkpoint=args.checkpoint,
@@ -180,6 +200,7 @@ def main():
         output_dir=args.output_dir,
         steps_list=args.steps,
         eta=args.eta,
+        bd_modifier=bd_modifier,
     )
 
 
