@@ -16,7 +16,7 @@ from diffusion.models import make_model
 from diffusion.pipeline import SamplingPipeline
 from diffusion.samplers import make_sampler
 from diffusion.schedulers import make_scheduler
-from diffusion.targets import ToyGaussianMixtureTarget
+from diffusion.targets import EmpiricalNoisedDataTarget, ToyGaussianMixtureTarget
 
 
 DEFAULT_PRETRAINED_MODEL = "google/ddpm-cifar10-32"
@@ -229,6 +229,24 @@ def sample_main(argv=None):
                         help=f"sample directly from a Diffusers repository, e.g. {DEFAULT_PRETRAINED_MODEL}")
     source.add_argument("--toy-mixture-oracle", action="store_true",
                         help="use the exact score model for the analytic 2D Gaussian-mixture target")
+    source.add_argument("--empirical-data-target", action="store_true",
+                        help="use the exact score/log density of a Gaussian-smoothed subset of a dataset")
+    parser.add_argument("--target-dataset", default="toy-mixture",
+                        help="dataset used by --empirical-data-target: cifar10, imagefolder, toy-images, or toy-mixture")
+    parser.add_argument("--target-data-dir", default="data",
+                        help="local dataset root for --empirical-data-target")
+    parser.add_argument("--target-download", action="store_true",
+                        help="download CIFAR-10 for --empirical-data-target when it is not present")
+    parser.add_argument("--target-image-size", type=int, default=32,
+                        help="image resolution used by image datasets for --empirical-data-target")
+    parser.add_argument("--target-toy-size", type=int, default=512,
+                        help="number of examples generated for a toy empirical target")
+    parser.add_argument("--target-reference-count", type=int, default=256,
+                        help="number of dataset examples used in the empirical Gaussian mixture")
+    parser.add_argument("--target-reference-seed", type=int, default=0,
+                        help="seed for selecting the empirical target's reference subset")
+    parser.add_argument("--target-reference-chunk-size", type=int, default=64,
+                        help="reference examples processed per log-density/score chunk")
     parser.add_argument("--pretrained-revision", default=None)
     parser.add_argument("--pretrained-unet-subfolder", default=None)
     parser.add_argument("--pretrained-scheduler-subfolder", default=None)
@@ -298,6 +316,27 @@ def sample_main(argv=None):
             "toy-mixture-oracle", target=target, alpha_bars=scheduler.alpha_bars
         ).to(device)
         sample_shape = (2,)
+    elif args.empirical_data_target:
+        scheduler_name = "linear" if args.scheduler == "auto" else args.scheduler
+        if scheduler_name == "huggingface":
+            raise ValueError("--empirical-data-target currently requires a local linear or cosine scheduler")
+        scheduler = make_scheduler(scheduler_name, args.timesteps, args.beta_start,
+                                   args.beta_end).to(device)
+        # This assumes the selected dataset is present locally (unless the user
+        # opts into CIFAR-10 download) and uses its data-module preprocessing.
+        data_module = make_data_module(
+            args.target_dataset, args.target_data_dir, args.target_image_size,
+            args.target_download, args.target_toy_size, args.target_reference_seed,
+        )
+        reference_dataset = data_module.dataset()
+        target = EmpiricalNoisedDataTarget.from_dataset(
+            reference_dataset,
+            num_reference_samples=args.target_reference_count,
+            seed=args.target_reference_seed,
+            reference_chunk_size=args.target_reference_chunk_size,
+        )
+        model = make_model("target-score", target=target, scheduler=scheduler).to(device)
+        sample_shape = tuple(data_module.sample_shape)
     else:
         model_id = args.pretrained_model_id or DEFAULT_PRETRAINED_MODEL
         model = make_model("huggingface-unet", pretrained_model_id=model_id,
@@ -319,8 +358,10 @@ def sample_main(argv=None):
     )
     modifiers = []
     if args.birth_death:
-        if target is None or not args.toy_mixture_oracle:
-            raise ValueError("--birth-death currently requires --toy-mixture-oracle with its known target density")
+        if target is None or not (args.toy_mixture_oracle or args.empirical_data_target):
+            raise ValueError(
+                "--birth-death requires --toy-mixture-oracle or --empirical-data-target with a known target density"
+            )
         if args.sampler not in {"langevin", "ula"}:
             raise ValueError("--birth-death currently supports only the fixed-target --sampler langevin")
         if args.count < 2:

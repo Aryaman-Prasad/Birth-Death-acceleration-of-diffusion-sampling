@@ -4,11 +4,7 @@ This document describes the project's current implementation of the birth-death 
 
 ## What is implemented
 
-The method lives in `src/diffusion/acceleration/birth_death.py` as a `SamplingModifier`. It runs after each sampler update and does not modify DDPM, DDIM, or Langevin sampler code. It is currently wired through `sample.py` only for:
-
-- the analytic eight-component 2D Gaussian-mixture target (`ToyGaussianMixtureTarget`);
-- its exact epsilon-prediction oracle (`ToyMixtureOracleModel`);
-- fixed-noise, unadjusted Langevin updates (`--sampler langevin`).
+The method lives in `src/diffusion/acceleration/birth_death.py` as a `SamplingModifier`. It runs after each sampler update and does not modify DDPM, DDIM, or Langevin sampler code. It is wired through `sample.py` for fixed-noise, unadjusted Langevin updates (`--sampler langevin`) with either the analytic toy mixture (`ToyGaussianMixtureTarget` and `ToyMixtureOracleModel`) or an empirical noised-data mixture (`EmpiricalNoisedDataTarget` and `TargetScoreModel`). Each pairing has a matching target density and score.
 
 The fixed population size is preserved at every modifier call. For each particle, one potential event is sampled using its centered birth/death rate. A death event replaces that particle with a uniformly selected other particle; a birth event replaces a uniformly selected other particle with a copy of the current particle. Consequently events alter particle ancestry and multiplicity while the batch still contains the same number of particles.
 
@@ -54,6 +50,32 @@ python3 sample.py --toy-mixture-oracle --sampler langevin --steps 1000 --count 2
 
 The vectors are saved as PyTorch tensors. The sampler's fixed noise level defaults to timestep zero; `--langevin-timestep` can choose another scheduler level. The KDE bandwidth is measured in normalized target coordinates. The population and step count should be kept the same when comparing runs. Use different seeds and settings to assess variability and bandwidth/step-size sensitivity.
 
+## Empirical target from a dataset subset
+
+`EmpiricalNoisedDataTarget` gives a precise meaning to a subset-based density estimate. Given preprocessed reference examples `x_0^(1), ..., x_0^(M)`, the forward process makes the normalized state `z = x_t / sqrt(alpha_bar_t)` a Gaussian mixture:
+
+\[
+\widehat p_t(z)=\frac{1}{M}\sum_{j=1}^M \mathcal N\!\left(z; x_0^{(j)}, \sigma_t^2 I\right),\qquad
+\sigma_t^2=\frac{1-\bar\alpha_t}{\bar\alpha_t}.
+\]
+
+The implementation evaluates the normalized log density with `logsumexp` and also evaluates its analytic score. `TargetScoreModel` converts that score to the epsilon prediction expected by the existing DDPM, DDIM, and Langevin samplers. Therefore, when this target is selected, the sampler score and the density used by birth-death refer to the same finite-data distribution. Subset selection is uniform and reproducible by seed; examples come through the dataset adapter's preprocessing (including image normalization). The target assumes the data is already available locally; pass `--target-download` only when you want CIFAR-10 fetched if it is missing.
+
+The mixture's smoothing scale `sigma_t` is fixed by the diffusion scheduler and timestep. It is separate from `--bd-kernel-bandwidth`, which controls the KDE over the current particle population in the birth-death rate.
+
+The empirical mixture is the exact smoothed distribution of the selected finite subset, but it is only a proxy for the unknown full data distribution. A small subset can omit modes, and kernel density estimation becomes statistically difficult in high-dimensional image spaces. The default reference count and chunk size are intended for smoke runs, not as validated CIFAR-10/CelebA density estimates. Evaluation costs O(B M D) arithmetic for batch size B, subset size M, and flattened data dimension D; reference chunking bounds temporary memory, not total work. Increase the subset only when runtime and memory permit, and report the subset, preprocessing, timestep, and KDE bandwidth in experiments.
+
+This mode does not combine a pretrained DDPM score with the subset log density. Those would generally describe different distributions, making the birth-death discrepancy inconsistent. A pretrained score can be useful for sampling, but a compatible log density would still need to be derived or estimated for the same learned distribution.
+
+Run matched ULA baselines with and without birth-death on the built-in vector toy dataset:
+
+```bash
+python3 sample.py --empirical-data-target --target-dataset toy-mixture --target-toy-size 512 --target-reference-count 256 --sampler langevin --steps 500 --count 128 --seed 7 --output samples/empirical-ula.pt
+python3 sample.py --empirical-data-target --target-dataset toy-mixture --target-toy-size 512 --target-reference-count 256 --sampler langevin --steps 500 --count 128 --birth-death --bd-kernel-bandwidth 0.3 --seed 7 --output samples/empirical-bd-ula.pt
+```
+
+For locally available image data, replace `toy-mixture` with `cifar10` or `imagefolder`, and set `--target-data-dir`, `--target-image-size`, and (for CIFAR-10 if required) `--target-download`. Use `--target-reference-count` to choose the subset size, `--target-reference-seed` to choose it reproducibly, and `--target-reference-chunk-size` to bound pairwise density-evaluation memory. The empirical target can also supply scores to DDPM, DDIM, and annealed Langevin without birth-death; the CLI only permits birth-death with fixed-target Langevin because that is the stationary-target setting currently implemented.
+
 ## Relationship to the paper and limits
 
 The implementation preserves the key BD construction from the paper: a nonlocal KDE-to-target-density discrepancy determines birth/death rates, and population resampling is composed with Langevin motion. It is therefore an executable finite-population experiment using a known target, rather than a placeholder or a density proxy inferred from the denoiser.
@@ -65,8 +87,8 @@ BD can improve mixing or convergence of a particle approximation; this implement
 ## What is not implemented yet
 
 - **BD with DDPM, DDIM, or annealed Langevin:** these methods visit a sequence of changing noisy distributions. Applying a stationary-target BD rate would be unjustified without specifying the target density, the state coordinates, and how the BD time increment maps to each diffusion update.
-- **BD for learned CIFAR-10/CelebA models:** an epsilon model can estimate a noisy score but does not provide the corresponding target log density needed by the rate. Estimating that density (or deriving a principled alternative) is a separate research task; no approximate image rule is silently applied here.
+- **BD paired with a learned CIFAR-10/CelebA score model:** an epsilon model estimates a noisy score but does not provide the corresponding target log density needed by the rate. The empirical-data mode is separate: it uses both the subset mixture's score and density, not a pretrained model's score. Combining a learned score and subset density would need a justified consistency argument.
 - **Variable-size particle populations, GPU-optimized KDE, and dedicated BD diagnostics/benchmarks:** the current implementation intentionally uses fixed population and a transparent dense pairwise KDE suitable for small 2D experiments.
 - **A paper-exact reproduction:** integrator conventions, event scheduling, model parameters, and benchmark protocol still need to be aligned if the goal becomes reproducing the paper's quantitative experiments.
 
-The command-line guard only permits this experimental BD implementation with the analytic toy oracle and fixed-target `langevin` sampler. The `SamplingModifier` interface remains available for future methods, but a new target/sampler pairing should document and justify its state-space density and event-time interpretation first.
+The command-line guard permits this experimental BD implementation with either the analytic toy oracle or the empirical noised-data target, and only with the fixed-target `langevin` sampler. The `SamplingModifier` interface remains available for future methods, but a new target/sampler pairing should document and justify its state-space density and event-time interpretation first.

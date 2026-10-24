@@ -178,25 +178,25 @@ At generation time, the sampler starts from Gaussian noise and applies reverse u
 ```text
 train.py, sample.py           Small entry points for training and generation
 src/diffusion/
-  models/                     Denoiser interface, image U-Net, vector MLP, pretrained adapter
+  models/                     Denoiser interface, image U-Net, vector MLP, pretrained and target-score adapters
   datasets/                   Data-module interface, CIFAR-10, ImageFolder, toy data
   schedulers/                 NoiseScheduler interface, linear, cosine, pretrained
   samplers/                   Sampler interface, DDPM, DDIM, ULA, and annealed Langevin
   metrics/                    Sampling NFE, timing, throughput, optional FID, and JSON output
-  targets/                    Log-density/score interface and analytic toy mixture
+  targets/                    Log-density/score interface, analytic toy mixture, and empirical noised-data target
   acceleration/               SamplingModifier interface and KDE birth-death update
   pipeline.py                 Sampling loop; composes sampler and modifiers
   engine.py                   Training epoch and checkpoint helpers
   cli.py                      Argument handling for the two root scripts
 ```
 
-- **Model:** subclass `DiffusionModel` and add it to `models.make_model` to make an architecture available by name. Its name can then be passed as `--model`. The current choices include an image U-Net, a vector MLP, and the optional pretrained Diffusers adapter.
+- **Model:** subclass `DiffusionModel` and add it to `models.make_model` to make an architecture available by name. Its name can then be passed as `--model`. The current choices include an image U-Net, a vector MLP, the optional pretrained Diffusers adapter, and `TargetScoreModel`, which adapts a known target score to epsilon prediction.
 - **Dataset:** subclass `DiffusionDataModule` and add it to `datasets.make_data_module`. A dataset should yield a tensor or `(tensor, label)` pair and expose `sample_shape`; image tensors should be normalized to `[-1, 1]`. The same interface supports image-shaped and vector-shaped data.
 - **Scheduler:** subclass `NoiseScheduler`, implement `make_betas`, and register it in `schedulers.make_scheduler`. It supplies the forward noising process and coefficients consumed by reverse updates. The pretrained adapter imports betas from the model repository's Diffusers scheduler configuration.
 - **Sampler:** subclass `Sampler`, implement `inference_timesteps` and one `step` update, then register it in `samplers.make_sampler`. Override `initial_samples` for sampler-specific initialization and `sampling_metadata` to share update information with modifiers. The pipeline handles model evaluation order and iteration. Its name can then be passed as `--sampler`.
 - **Sampling modifier:** subclass `SamplingModifier` and attach it to a `SamplingPipeline`. The pipeline applies modifiers after each sampler update during generation. A modifier can change the sample population size and does not participate in training.
-- **Target distribution:** implement `TargetDistribution.log_prob` and `.score` for a stationary target on the sampler's state coordinates. The target interface is currently used by birth-death, which needs density values in addition to score estimates.
+- **Target distribution:** implement `TargetDistribution.log_prob` and `.score` for a target on the sampler's state coordinates. The analytic toy mixture and empirical noised-data mixture implement this interface. Birth-death needs the log density; `TargetScoreModel` can also turn a target score into the epsilon-prediction interface used by the samplers.
 
 ## Birth-death implementation scope
 
-The birth-death method now runs as an optional `SamplingModifier` after fixed-target Langevin updates. The CLI currently exposes it only with the exact toy-mixture oracle because the method requires target log densities; a learned DDPM epsilon predictor supplies a score estimate but not `log p_t(x)`. For the equations, discrete event rule, and known limitations, see [DOCS-BD.md](DOCS-BD.md). It changes particle ancestry while preserving the population size; this implementation does not remove Langevin time steps from a trajectory. Standard DDPM/DDIM remain unchanged when the modifier is absent, and training never invokes it.
+The birth-death method now runs as an optional `SamplingModifier` after fixed-target Langevin updates. In addition to the analytic toy target, `--empirical-data-target` constructs an exact Gaussian-mixture density and score from a seeded subset of a selected dataset. The subset density is a clear target for experiments but only approximates the full data distribution; small-subset KDE in image space may be poor. A pretrained DDPM model's score is not automatically consistent with this empirical target, so the empirical-target mode uses its own analytic score adapter. For the equations, commands, and limitations, see [DOCS-BD.md](DOCS-BD.md). Birth-death changes particle ancestry while preserving population size; this implementation does not remove Langevin time steps from a trajectory. Training never invokes it.
