@@ -20,7 +20,8 @@ class SamplingPipeline:
     @torch.no_grad()
     def sample(self, model: nn.Module, shape: tuple[int, ...], device: torch.device,
                num_inference_steps: int | None = None,
-               generator: torch.Generator | None = None) -> torch.Tensor:
+               generator: torch.Generator | None = None,
+               modifier_generator: torch.Generator | None = None) -> torch.Tensor:
         model.eval()
         self.scheduler.to(device)
         timesteps = self.sampler.inference_timesteps(self.scheduler, num_inference_steps, device)
@@ -55,7 +56,10 @@ class SamplingPipeline:
                 context=context,
             )
             for modifier in self.modifiers:
-                state = modifier.apply(state, model=model, scheduler=self.scheduler, generator=generator)
+                state = modifier.apply(
+                    state, model=model, scheduler=self.scheduler,
+                    generator=(modifier_generator if modifier_generator is not None else generator),
+                )
             samples = state.samples
         # Images in the framework are represented in [-1, 1]. Vector targets
         # (including the toy mixture) have their own meaningful coordinates.

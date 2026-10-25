@@ -134,6 +134,23 @@ The sampling metrics include:
 
 These measurements add no model evaluations and do not change generated samples. For fair speed comparisons, use the same checkpoint, sample count, device, and seed, and repeat runs to account for warm-up and device load. NFE is useful for comparing algorithmic work independently from hardware speed.
 
+When `--empirical-data-target` is selected, `sample.py` also reports quality metrics against the finite reference subset loaded for that target:
+
+- **Empirical-target NLL:** average negative log density under the Gaussian-smoothed finite reference mixture. The output includes nats per sample and nats per dimension. DDPM/DDIM clean outputs are evaluated as the timestep-0 marginal; Langevin outputs are scored at the timestep represented by their state.
+- **Empirical-target MMD-squared:** a biased, multi-scale RBF MMD in flattened sample coordinates (pixel space for images). It compares the generated preview (`--count`) with the clean reference subset for DDPM/DDIM; Langevin states are compared with a reproducible draw from the matching noised empirical target. The JSON records the reference distance used to set the RBF bandwidths and the MMD sample/reference counts.
+
+These are diagnostics relative to the selected subset, not estimates of the true full-data NLL or a perceptual image score. In particular, an empirical target with a small reference count is only a finite Gaussian mixture. Pixel-space MMD can be useful for controlled comparisons, but FID or a perceptual feature-space metric is better suited to judging visual similarity. A pretrained/checkpoint model by itself does not expose a normalized data log density, so `sample.py` does not claim to report NLL for those sources.
+
+MMD variance depends on both the generated count and reference count. Keep them fixed across comparisons, and increase `--count` beyond its small preview-oriented default when you want a more stable MMD estimate.
+
+For example, this computes the empirical-target NLL and MMD in addition to NFE/time, and saves all values in the JSON sidecar:
+
+```bash
+python3 sample.py --empirical-data-target --target-dataset cifar10 --target-data-dir data --target-download --target-image-size 32 --target-reference-count 32 --sampler ddim --steps 25 --eta 1 --birth-death --bd-every-k 2 --count 16 --seed 7 --device cuda --output samples/cifar-empirical-bd-ddim.png
+```
+
+NLL and MMD for this command use the 32 selected training examples; they are not metrics against the CIFAR-10 test set. FID remains separately opt-in with `--fid` and its own reference-data options.
+
 FID is optional because it adds an Inception feature-extraction pass and needs a real image reference set. Install the `fid` extra above, then opt in when sampling. If sampling a Hugging Face model, install both extras with `python3 -m pip install -e ".[pretrained,fid]"`. For a pretrained CIFAR-10 model, the following uses CIFAR-10's test split and generates 10,000 images in batches of 64:
 
 ```bash
@@ -143,6 +160,8 @@ python3 sample.py --pretrained-model-id google/ddpm-cifar10-32 --sampler ddim --
 The ordinary `--count` still controls the saved preview grid. `--fid-samples` controls the number of generated and real images used for the score (default `10000`), and `--fid-batch-size` controls streaming memory use. The command saves only the first `--count` generated images but evaluates FID over the full set. For an ImageFolder reference set, pass `--fid-dataset imagefolder --fid-data-dir data/my-images`; the directory must contain class subfolders. Set `--fid-samples` no higher than the number of available reference images. FID requires RGB image models and uses feature dimension 2048. Its evaluation time is reported separately from diffusion sampling time. The JSON sidecar includes the FID score and reference configuration.
 
 FID compares Inception feature statistics for real and generated images and is sensitive to sample count and preprocessing. Use the same reference split, number of samples, and image resolution when comparing runs. Tiny sample sets or procedural toy images do not provide a meaningful image-quality benchmark. TorchMetrics expects normalized RGB images and its default Inception feature extractor uses the optional `torch-fidelity` dependency; see the [TorchMetrics FID documentation](https://lightning.ai/docs/torchmetrics/stable/image/frechet_inception_distance.html).
+
+FID is a property of the generated and reference sets, not a direct function of the birth-death kernel bandwidth. Changing bandwidth can change birth/death event probabilities and hence the final samples, but the final FID need not change measurably. In high-dimensional image space, a bandwidth much smaller than particle-to-particle distances makes each particle's KDE dominated by its own kernel term; event probabilities can also saturate. In those regimes, quite different bandwidths can lead to the same resampling decisions. Check the saved unique-sample count and compare the generated files when investigating this. Keep the seed, sample count, FID reference split, and all other settings fixed; test bandwidths on a scale informed by pairwise distances in the actual birth-death state coordinates.
 
 ### Use a pretrained Diffusers model
 
@@ -191,7 +210,7 @@ src/diffusion/
   datasets/                   Data-module interface, CIFAR-10, ImageFolder, toy data
   schedulers/                 NoiseScheduler interface, linear, cosine, pretrained
   samplers/                   Sampler interface, DDPM, DDIM, ULA, and annealed Langevin
-  metrics/                    Sampling NFE, timing, throughput, optional FID, and JSON output
+  metrics/                    Sampling NFE, timing, throughput, MMD, optional FID, and JSON output
   targets/                    Log-density/score interface, analytic toy mixture, and empirical noised-data target
   acceleration/               SamplingModifier interface and KDE birth-death update
   sampling.py                 Shared post-update state context for samplers and modifiers

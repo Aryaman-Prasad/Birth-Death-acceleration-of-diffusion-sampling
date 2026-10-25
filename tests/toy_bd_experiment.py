@@ -1,8 +1,9 @@
-"""Compare toy-mixture diffusion sampling with and without birth-death.
+"""Compare toy-mixture sampling with DDPM, DDIM, and fixed-target Langevin,
+with and without birth-death.
 
 Run from the repository root, for example:
 
-    python3 tests/toy_bd_experiment.py --sampler ddim --steps 50 --count 256
+    python3 tests/toy_bd_experiment.py --sampler all --steps 50 --count 256
 
 This is a small end-to-end experiment runner, not a unit-test suite. It uses
 the analytic toy target so generated samples can be scored against its exact
@@ -66,10 +67,13 @@ def _rbf_mmd_squared(samples: torch.Tensor, references: torch.Tensor,
 
 @torch.no_grad()
 def _toy_quality(samples: torch.Tensor, target: ToyGaussianMixtureTarget,
-                 references: torch.Tensor) -> dict:
+                 references: torch.Tensor, sampling_noise_std: float = 0.0) -> dict:
     """Score clean samples under p_0 and report occupancy of the known modes."""
     samples = samples.to(target.centers)
     clean_log_prob = target.log_prob_at_noise(samples, sigma=0.0)
+    sampling_target_nll = -target.log_prob_at_noise(
+        samples, sigma=sampling_noise_std
+    ).mean()
     distances_squared = torch.cdist(samples, target.centers).square()
     nearest_modes = distances_squared.argmin(dim=1)
     counts = torch.bincount(nearest_modes, minlength=target.centers.shape[0])
@@ -81,6 +85,8 @@ def _toy_quality(samples: torch.Tensor, target: ToyGaussianMixtureTarget,
     }
     return {
         "clean_target_nll": float(-clean_log_prob.mean().item()),
+        "sampling_target_nll": float(sampling_target_nll.item()),
+        "sampling_target_noise_std": float(sampling_noise_std),
         "clean_target_mmd2_rbf_multiscale": sum(mmd_by_bandwidth.values()) / len(mmd_by_bandwidth),
         "clean_target_mmd2_rbf_by_bandwidth": mmd_by_bandwidth,
         "mode_coverage": float((counts > 0).float().mean().item()),
@@ -93,8 +99,19 @@ def _toy_quality(samples: torch.Tensor, target: ToyGaussianMixtureTarget,
 
 def _run_case(model, target, references, scheduler, device, args,
               sampler_name: str, birth_death: bool) -> tuple[dict, torch.Tensor]:
-    sampler = make_sampler(sampler_name, eta=args.eta)
-    inference_steps = None if sampler_name == "ddpm" else args.steps
+    sampler = make_sampler(
+        sampler_name,
+        eta=args.eta,
+        langevin_step_size=args.langevin_step_size,
+        langevin_timestep=args.langevin_timestep,
+        langevin_initial_scale=args.langevin_initial_scale,
+    )
+    if sampler_name == "ddpm":
+        inference_steps = None
+    elif sampler_name == "langevin":
+        inference_steps = args.langevin_steps
+    else:
+        inference_steps = args.steps
     sampler_steps = len(sampler.inference_timesteps(scheduler, inference_steps, device))
     modifiers = []
     if birth_death:
@@ -106,6 +123,9 @@ def _run_case(model, target, references, scheduler, device, args,
         ))
     pipeline = SamplingPipeline(sampler, scheduler, modifiers=modifiers)
     generator = torch.Generator(device=device).manual_seed(args.seed)
+    # Pair sampler randomness between baseline and BD. BD has its own stream,
+    # so its event draws do not shift later sampler-noise draws.
+    modifier_generator = torch.Generator(device=device).manual_seed(args.seed + 100_003)
     shape = (args.count, *target.centers.shape[1:])
     samples, sampling_metrics = measure_sampling(
         model,
@@ -113,15 +133,22 @@ def _run_case(model, target, references, scheduler, device, args,
         args.count,
         sampler_steps,
         lambda: pipeline.sample(
-            model, shape, device, inference_steps, generator
+            model, shape, device, inference_steps, generator, modifier_generator
         ),
     )
     record = sampling_metrics.to_dict()
-    record.update(_toy_quality(samples, target, references))
+    sampling_noise_std = (
+        float(target.noise_std(args.langevin_timestep, scheduler).item())
+        if sampler_name == "langevin" else 0.0
+    )
+    record.update(_toy_quality(samples, target, references, sampling_noise_std))
     record.update({
         "sampler": sampler_name,
         "birth_death_enabled": birth_death,
         "seed": args.seed,
+        "langevin_step_size": args.langevin_step_size if sampler_name == "langevin" else None,
+        "langevin_timestep": args.langevin_timestep if sampler_name == "langevin" else None,
+        "langevin_initial_scale": args.langevin_initial_scale if sampler_name == "langevin" else None,
         "bd_kernel_bandwidth": args.bd_kernel_bandwidth if birth_death else None,
         "bd_every_k_steps": args.bd_every_k if birth_death else None,
         "bd_total_time": args.bd_total_time if birth_death else None,
@@ -152,9 +179,9 @@ def _print_results(results: list[dict]) -> None:
 
 def main(argv=None) -> None:
     parser = argparse.ArgumentParser(
-        description="Compare toy-mixture DDPM/DDIM sampling with and without birth-death"
+        description="Compare toy-mixture DDPM, DDIM, and Langevin sampling with and without birth-death"
     )
-    parser.add_argument("--sampler", choices=("ddpm", "ddim", "both"), default="ddim")
+    parser.add_argument("--sampler", choices=("ddpm", "ddim", "langevin", "both", "all"), default="ddim")
     parser.add_argument("--steps", type=int, default=50,
                         help="DDIM updates; DDPM always uses all scheduler timesteps")
     parser.add_argument("--timesteps", type=int, default=1000,
@@ -164,6 +191,12 @@ def main(argv=None) -> None:
     parser.add_argument("--beta-end", type=float, default=2e-2)
     parser.add_argument("--eta", type=float, default=0.0,
                         help="DDIM stochasticity; zero keeps the sampler deterministic")
+    parser.add_argument("--langevin-steps", type=int, default=1000,
+                        help="fixed-target ULA updates (DDPM always uses all timesteps)")
+    parser.add_argument("--langevin-step-size", type=float, default=1e-3)
+    parser.add_argument("--langevin-timestep", type=int, default=0,
+                        help="DDPM noise level defining the fixed Langevin target")
+    parser.add_argument("--langevin-initial-scale", type=float, default=1.0)
     parser.add_argument("--count", type=int, default=256,
                         help="particle count for each sampler trajectory; must be at least 2")
     parser.add_argument("--seed", type=int, default=7)
@@ -179,8 +212,10 @@ def main(argv=None) -> None:
 
     if args.count < 2:
         parser.error("--count must be at least 2 for birth-death")
-    if args.steps < 1 or args.timesteps < 2:
-        parser.error("--steps must be positive and --timesteps must be at least 2")
+    if args.steps < 1 or args.langevin_steps < 1 or args.timesteps < 2:
+        parser.error("sampler steps must be positive and --timesteps must be at least 2")
+    if not 0 <= args.langevin_timestep < args.timesteps:
+        parser.error("--langevin-timestep must be between 0 and --timesteps - 1")
 
     device = _device(args.device)
     target = ToyGaussianMixtureTarget(
@@ -197,7 +232,12 @@ def main(argv=None) -> None:
     reference_generator = torch.Generator(device=device).manual_seed(args.seed + 1)
     references = _sample_target(target, max(args.count, 512), reference_generator)
 
-    sampler_names = ("ddpm", "ddim") if args.sampler == "both" else (args.sampler,)
+    if args.sampler == "both":
+        sampler_names = ("ddpm", "ddim")
+    elif args.sampler == "all":
+        sampler_names = ("ddpm", "ddim", "langevin")
+    else:
+        sampler_names = (args.sampler,)
     results = []
     samples_by_run = {}
     for sampler_name in sampler_names:
@@ -221,6 +261,10 @@ def main(argv=None) -> None:
         "seed": args.seed,
         "training_timesteps": args.timesteps,
         "ddim_steps": args.steps,
+        "langevin_steps": args.langevin_steps,
+        "langevin_step_size": args.langevin_step_size,
+        "langevin_timestep": args.langevin_timestep,
+        "langevin_initial_scale": args.langevin_initial_scale,
         "toy_target": {
             "radius": args.radius,
             "mode_standard_deviation": args.mode_standard_deviation,

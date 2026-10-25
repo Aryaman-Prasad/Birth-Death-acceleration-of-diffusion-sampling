@@ -2,6 +2,7 @@
 
 import argparse
 import math
+import sys
 from pathlib import Path
 
 import torch
@@ -11,7 +12,13 @@ from torch.utils.data import DataLoader
 from diffusion.datasets import make_data_module
 from diffusion.acceleration.birth_death import BirthDeathAcceleration
 from diffusion.engine import load_checkpoint, save_checkpoint, train_epoch
-from diffusion.metrics import FIDEvaluator, SamplingMetrics, measure_sampling, write_metrics
+from diffusion.metrics import (
+    FIDEvaluator,
+    SamplingMetrics,
+    measure_sampling,
+    rbf_mmd_squared,
+    write_metrics,
+)
 from diffusion.models import make_model
 from diffusion.pipeline import SamplingPipeline
 from diffusion.samplers import make_sampler
@@ -51,7 +58,8 @@ def _model_configuration(name: str, sample_shape: tuple[int, ...], base_channels
     return name, model_args
 
 
-def _sample_with_fid(model, pipeline, sample_shape, device, args, sampler_steps, generator):
+def _sample_with_fid(model, pipeline, sample_shape, device, args, sampler_steps,
+                     generator, modifier_generator):
     """Stream an FID-sized generated set while retaining only the preview grid."""
     if len(sample_shape) != 3 or sample_shape[0] != 3:
         raise ValueError("FID is available only for RGB image models")
@@ -109,7 +117,7 @@ def _sample_with_fid(model, pipeline, sample_shape, device, args, sampler_steps,
         generated, batch_metrics = measure_sampling(
             model, device, batch_count, sampler_steps,
             lambda shape=shape: pipeline.sample(
-                model, shape, device, args.steps, generator
+                model, shape, device, args.steps, generator, modifier_generator
             ),
         )
         total_nfe += batch_metrics.nfe
@@ -138,6 +146,100 @@ def _sample_with_fid(model, pipeline, sample_shape, device, args, sampler_steps,
     )
     samples = torch.cat(preview_batches, dim=0)
     return samples, metrics, fid_score, evaluator.elapsed_seconds
+
+
+@torch.no_grad()
+def _empirical_target_metrics(samples, target, sampler, scheduler, args):
+    """Score samples against the same finite data subset used as the target.
+
+    The sampler describes its final state through SamplingContext. That keeps
+    the metric coordinate conversion aligned with the sampler interface rather
+    than relying on sampler names.
+    """
+    references = target.reference_samples.to(device=samples.device, dtype=samples.dtype)
+    trajectory = sampler.inference_timesteps(scheduler, args.steps, samples.device)
+    last_timestep = int(trajectory[-1].item())
+    final_context = sampler.sampling_context(last_timestep, -1, scheduler)
+    if final_context.is_clean_sample or final_context.state_coordinates == "clean_x0":
+        density_timestep = 0
+        alpha_bar = scheduler.alpha_bars[density_timestep].to(samples)
+        density_samples = samples / alpha_bar.sqrt()
+        state_description = "clean x0 treated as the timestep-0 empirical marginal"
+        # DDPM/DDIM return clean image estimates; comparing those against the
+        # clean reference examples gives an intuitive data-space MMD.
+        mmd_timestep = None
+        mmd_state_description = "clean reference examples"
+        mmd_samples = samples
+    else:
+        if final_context.state_timestep is None:
+            raise ValueError("the final sampler state does not specify a target timestep")
+        density_timestep = int(final_context.state_timestep)
+        if final_context.state_coordinates == "normalized_x_t":
+            density_samples = samples
+        elif final_context.state_coordinates == "x_t":
+            alpha_bar = scheduler.alpha_bars[density_timestep].to(samples)
+            density_samples = samples / alpha_bar.sqrt()
+        else:
+            raise ValueError(
+                "empirical-target metrics support final states in x_t, normalized_x_t, "
+                "or clean_x0 coordinates"
+            )
+        state_description = (
+            f"{final_context.state_coordinates} sampler state at timestep {density_timestep}"
+        )
+        mmd_timestep = density_timestep
+        mmd_samples = density_samples
+        mmd_state_description = (
+            f"sampled Gaussian-smoothed target at timestep {density_timestep}"
+        )
+
+    if mmd_timestep is None:
+        mmd_references = references
+    else:
+        # ULA states represent a noised empirical marginal rather than clean
+        # images. Draw an independent reproducible reference set from that
+        # same finite Gaussian mixture before comparing them with MMD.
+        metric_generator = torch.Generator(device=samples.device)
+        if args.seed is None:
+            metric_generator.seed()
+        else:
+            metric_generator.manual_seed(args.seed + 200_003)
+        indices = torch.randint(
+            references.shape[0], (references.shape[0],),
+            device=samples.device, generator=metric_generator,
+        )
+        sigma = target.noise_std(
+            mmd_timestep, scheduler, device=samples.device, dtype=samples.dtype
+        )
+        reference_noise = torch.randn(
+            references.shape, device=samples.device, dtype=samples.dtype,
+            generator=metric_generator,
+        )
+        mmd_references = references.index_select(0, indices) + sigma * reference_noise
+
+    quality_metrics, metadata = rbf_mmd_squared(mmd_samples, mmd_references)
+
+    log_prob = target.log_prob(density_samples, density_timestep, scheduler)
+    mean_nll = float((-log_prob.mean()).item())
+    dimensions = density_samples[0].numel()
+    quality_metrics.update({
+        "empirical_target_nll": mean_nll,
+        "empirical_target_nll_per_dimension": mean_nll / dimensions,
+    })
+    metadata.update({
+        "empirical_target_nll_scope": (
+            "negative log density under the Gaussian-smoothed finite reference subset; "
+            "not the unknown full source-dataset density"
+        ),
+        "empirical_target_nll_evaluation_timestep": int(density_timestep),
+        "empirical_target_nll_sample_state": state_description,
+        "empirical_target_nll_sample_count": int(samples.shape[0]),
+        "empirical_target_nll_reference_count": int(references.shape[0]),
+        "empirical_target_nll_dimensions": int(dimensions),
+        "empirical_target_mmd_reference_state": mmd_state_description,
+        "empirical_target_mmd_evaluation_timestep": mmd_timestep,
+    })
+    return quality_metrics, metadata
 
 
 def train_main(argv=None):
@@ -300,6 +402,14 @@ def sample_main(argv=None):
     parser.add_argument("--device", default="auto")
     args = parser.parse_args(argv)
 
+    if args.birth_death and args.sampler == "ddim" and args.eta == 0.0:
+        print(
+            "warning: DDIM with eta=0 is deterministic. Birth-death can copy particles, "
+            "and identical copies then remain identical through later DDIM updates. "
+            "Consider a positive --eta and tune --bd-total-time and --bd-kernel-bandwidth.",
+            file=sys.stderr,
+        )
+
     device = _device(args.device)
     target = None
     if args.checkpoint:
@@ -387,18 +497,26 @@ def sample_main(argv=None):
         ))
     pipeline = SamplingPipeline(sampler, scheduler, modifiers=modifiers)
     generator = torch.Generator(device=device).manual_seed(args.seed) if args.seed is not None else None
+    modifier_generator = torch.Generator(device=device)
+    if args.seed is None:
+        modifier_generator.seed()
+    else:
+        modifier_generator.manual_seed(args.seed + 100_003)
     sampler_steps = len(sampler.inference_timesteps(scheduler, args.steps, device))
     fid_score = None
     fid_seconds = None
     if args.fid:
         samples, metrics, fid_score, fid_seconds = _sample_with_fid(
-            model, pipeline, sample_shape, device, args, sampler_steps, generator
+            model, pipeline, sample_shape, device, args, sampler_steps,
+            generator, modifier_generator,
         )
     else:
         shape = (args.count, *sample_shape)
         samples, metrics = measure_sampling(
             model, device, args.count, sampler_steps,
-            lambda: pipeline.sample(model, shape, device, args.steps, generator),
+            lambda: pipeline.sample(
+                model, shape, device, args.steps, generator, modifier_generator
+            ),
         )
 
     output = Path(args.output) if args.output else Path(
@@ -407,8 +525,17 @@ def sample_main(argv=None):
     output.parent.mkdir(parents=True, exist_ok=True)
     if samples.ndim == 4:
         save_image((samples + 1) / 2, output, nrow=args.nrow)
+        # Count the distinct image tiles that survive the same 8-bit rounding
+        # used by save_image, so exact visual duplicates are visible in metrics.
+        saved_samples = ((samples + 1) * 127.5 + 0.5).clamp(0, 255).to(torch.uint8)
+        unique_sample_label = "distinct 8-bit image tiles"
     else:
         torch.save(samples.cpu(), output)
+        saved_samples = samples
+        unique_sample_label = "distinct saved samples"
+    saved_preview_unique_count = int(
+        torch.unique(saved_samples.reshape(saved_samples.shape[0], -1), dim=0).shape[0]
+    )
     metrics_path = Path(args.metrics_output) if args.metrics_output else output.with_name(
         f"{output.stem}.metrics.json"
     )
@@ -426,9 +553,18 @@ def sample_main(argv=None):
         "sample_shape": list(sample_shape),
         "sample_output": str(output),
         "saved_preview_count": int(samples.shape[0]),
+        "saved_preview_unique_count": saved_preview_unique_count,
         "scheduler": type(scheduler).__name__,
         "birth_death_enabled": args.birth_death,
     }
+    if args.empirical_data_target:
+        metadata.update({
+            "target_dataset": args.target_dataset,
+            "target_data_dir": args.target_data_dir,
+            "target_reference_count": args.target_reference_count,
+            "target_reference_seed": args.target_reference_seed,
+            "target_reference_chunk_size": args.target_reference_chunk_size,
+        })
     if args.sampler in {"langevin", "ula", "annealed-langevin", "ald"}:
         metadata.update({
             "langevin_step_size": sampler.step_size,
@@ -446,15 +582,13 @@ def sample_main(argv=None):
                 "toy_mixture_radius": args.toy_mixture_radius,
                 "toy_mixture_standard_deviation": args.toy_mixture_standard_deviation,
             })
-        if args.empirical_data_target:
-            metadata.update({
-                "target_dataset": args.target_dataset,
-                "target_data_dir": args.target_data_dir,
-                "target_reference_count": args.target_reference_count,
-                "target_reference_seed": args.target_reference_seed,
-                "target_reference_chunk_size": args.target_reference_chunk_size,
-            })
-    additional_metrics = None
+    additional_metrics = {}
+    if args.empirical_data_target:
+        target_metrics, target_metric_metadata = _empirical_target_metrics(
+            samples, target, sampler, scheduler, args
+        )
+        additional_metrics.update(target_metrics)
+        metadata.update(target_metric_metadata)
     if args.fid:
         metadata.update({
             "fid_reference_dataset": args.fid_dataset,
@@ -465,12 +599,13 @@ def sample_main(argv=None):
             "fid_num_workers": args.fid_num_workers,
             "fid_feature_dimension": 2048,
         })
-        additional_metrics = {
+        additional_metrics.update({
             "fid": fid_score,
             "fid_evaluation_seconds": fid_seconds,
-        }
-    write_metrics(metrics_path, metrics, metadata, additional_metrics)
+        })
+    write_metrics(metrics_path, metrics, metadata, additional_metrics or None)
     print(f"saved {samples.shape[0]} samples to {output}")
+    print(f"{unique_sample_label}={saved_preview_unique_count}/{samples.shape[0]}")
     print(f"sampler={args.sampler} | steps={metrics.sampler_steps} | NFE={metrics.nfe} | "
           f"model_forward_calls={metrics.model_forward_calls} | "
           f"time={metrics.elapsed_seconds:.2f}s | "
@@ -478,4 +613,13 @@ def sample_main(argv=None):
     if args.fid:
         print(f"FID-2048={fid_score:.4f} | samples={args.fid_samples} | "
               f"reference={args.fid_dataset} | evaluation_time={fid_seconds:.2f}s")
+    if args.empirical_data_target:
+        print(
+            "empirical-target metrics | "
+            f"NLL={additional_metrics['empirical_target_nll']:.4f} nats/sample "
+            f"({additional_metrics['empirical_target_nll_per_dimension']:.6f} nats/dimension, "
+            f"t={metadata['empirical_target_nll_evaluation_timestep']}) | "
+            f"MMD^2={additional_metrics['empirical_target_mmd2_rbf_multiscale']:.6f} "
+            "(pixel/sample-coordinate RBF, multi-scale)"
+        )
     print(f"saved sampling metrics to {metrics_path}")
