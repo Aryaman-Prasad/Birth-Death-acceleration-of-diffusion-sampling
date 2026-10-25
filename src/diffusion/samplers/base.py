@@ -5,6 +5,7 @@ from abc import ABC, abstractmethod
 import torch
 from torch import nn
 
+from diffusion.sampling import SamplingContext
 from diffusion.schedulers.base import NoiseScheduler
 
 
@@ -17,8 +18,19 @@ class Sampler(ABC):
 
     def sampling_metadata(self, timestep: int, previous_timestep: int,
                           scheduler: NoiseScheduler) -> dict:
-        """Describe this update to modifiers; ordinary reverse samplers need none."""
+        """Return sampler-specific metadata in addition to the state context."""
         return {}
+
+    def sampling_context(self, timestep: int, previous_timestep: int,
+                         scheduler: NoiseScheduler) -> SamplingContext:
+        """Describe the state produced by ``step`` for sampling modifiers.
+
+        The default describes a reverse update that returns ``x_previous``.
+        Samplers with different state semantics should override this method.
+        """
+        if previous_timestep < 0:
+            return SamplingContext(None, "clean_x0", is_clean_sample=True)
+        return SamplingContext(previous_timestep, "x_t")
 
     @abstractmethod
     def inference_timesteps(self, scheduler: NoiseScheduler, num_inference_steps: int | None,

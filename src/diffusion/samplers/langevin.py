@@ -3,7 +3,7 @@
 import torch
 from torch import nn
 
-from diffusion.samplers.base import Sampler
+from diffusion.samplers.base import Sampler, SamplingContext
 from diffusion.schedulers.base import NoiseScheduler
 
 
@@ -70,6 +70,12 @@ class LangevinSampler(Sampler):
             "state_coordinates": "normalized_x_t",
         }
 
+    def sampling_context(self, timestep: int, previous_timestep: int,
+                         scheduler: NoiseScheduler) -> SamplingContext:
+        # Fixed-target ULA remains at the same scheduler noise level after its
+        # update; its particle tensor stores normalized x_t coordinates.
+        return SamplingContext(self.timestep, "normalized_x_t")
+
     @torch.no_grad()
     def step(self, model: nn.Module, noisy_images: torch.Tensor, timestep: int,
              previous_timestep: int, scheduler: NoiseScheduler,
@@ -105,6 +111,12 @@ class AnnealedLangevinSampler(Sampler):
             scheduler.num_train_timesteps - 1, 0, levels, device=device
         ).round().long()
         return level_indices.repeat_interleave(self.steps_per_level)
+
+    def sampling_context(self, timestep: int, previous_timestep: int,
+                         scheduler: NoiseScheduler) -> SamplingContext:
+        # Each update uses the current level's score in normalized coordinates;
+        # the next level is selected on the following sampler iteration.
+        return SamplingContext(timestep, "normalized_x_t")
 
     def initial_samples(self, shape: tuple[int, ...], device: torch.device,
                         scheduler: NoiseScheduler, timesteps: torch.Tensor,

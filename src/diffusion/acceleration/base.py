@@ -6,15 +6,18 @@ from typing import Any
 
 import torch
 
+from diffusion.sampling import SamplingContext
+
 
 @dataclass
 class SamplingState:
-    """Current sample population and time indices between reverse updates."""
+    """Current population plus its post-update noise level and coordinates."""
 
     samples: torch.Tensor
     timestep: int
     previous_timestep: int
     metadata: dict[str, Any] = field(default_factory=dict)
+    context: SamplingContext | None = None
 
 
 class SamplingModifier(ABC):

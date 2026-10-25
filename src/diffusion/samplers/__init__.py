@@ -1,6 +1,6 @@
 """Reverse-process update rules."""
 
-from diffusion.samplers.base import Sampler
+from diffusion.samplers.base import Sampler, SamplingContext
 from diffusion.samplers.ddim import DDIMSampler
 from diffusion.samplers.ddpm import DDPMSampler
 from diffusion.samplers.langevin import AnnealedLangevinSampler, LangevinSampler
@@ -27,5 +27,5 @@ def make_sampler(name: str, eta: float = 0.0, *, langevin_step_size: float | Non
     raise ValueError(f"Unknown sampler: {name}")
 
 
-__all__ = ["Sampler", "DDPMSampler", "DDIMSampler", "LangevinSampler",
+__all__ = ["Sampler", "SamplingContext", "DDPMSampler", "DDIMSampler", "LangevinSampler",
            "AnnealedLangevinSampler", "make_sampler"]

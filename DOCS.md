@@ -185,6 +185,7 @@ src/diffusion/
   metrics/                    Sampling NFE, timing, throughput, optional FID, and JSON output
   targets/                    Log-density/score interface, analytic toy mixture, and empirical noised-data target
   acceleration/               SamplingModifier interface and KDE birth-death update
+  sampling.py                 Shared post-update state context for samplers and modifiers
   pipeline.py                 Sampling loop; composes sampler and modifiers
   engine.py                   Training epoch and checkpoint helpers
   cli.py                      Argument handling for the two root scripts
@@ -193,7 +194,7 @@ src/diffusion/
 - **Model:** subclass `DiffusionModel` and add it to `models.make_model` to make an architecture available by name. Its name can then be passed as `--model`. The current choices include an image U-Net, a vector MLP, the optional pretrained Diffusers adapter, and `TargetScoreModel`, which adapts a known target score to epsilon prediction.
 - **Dataset:** subclass `DiffusionDataModule` and add it to `datasets.make_data_module`. A dataset should yield a tensor or `(tensor, label)` pair and expose `sample_shape`; image tensors should be normalized to `[-1, 1]`. The same interface supports image-shaped and vector-shaped data.
 - **Scheduler:** subclass `NoiseScheduler`, implement `make_betas`, and register it in `schedulers.make_scheduler`. It supplies the forward noising process and coefficients consumed by reverse updates. The pretrained adapter imports betas from the model repository's Diffusers scheduler configuration.
-- **Sampler:** subclass `Sampler`, implement `inference_timesteps` and one `step` update, then register it in `samplers.make_sampler`. Override `initial_samples` for sampler-specific initialization and `sampling_metadata` to share update information with modifiers. The pipeline handles model evaluation order and iteration. Its name can then be passed as `--sampler`.
+- **Sampler:** subclass `Sampler`, implement `inference_timesteps` and one `step` update, then register it in `samplers.make_sampler`. Override `initial_samples` for sampler-specific initialization, `sampling_context` to describe the returned state's noise level and coordinates, and `sampling_metadata` for other modifier information. The pipeline handles model evaluation order and iteration. Its name can then be passed as `--sampler`.
 - **Sampling modifier:** subclass `SamplingModifier` and attach it to a `SamplingPipeline`. The pipeline applies modifiers after each sampler update during generation. A modifier can change the sample population size and does not participate in training.
 - **Target distribution:** implement `TargetDistribution.log_prob` and `.score` for a target on the sampler's state coordinates. The analytic toy mixture and empirical noised-data mixture implement this interface. Birth-death needs the log density; `TargetScoreModel` can also turn a target score into the epsilon-prediction interface used by the samplers.
 

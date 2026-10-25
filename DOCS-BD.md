@@ -8,6 +8,18 @@ The method lives in `src/diffusion/acceleration/birth_death.py` as a `SamplingMo
 
 The fixed population size is preserved at every modifier call. For each particle, one potential event is sampled using its centered birth/death rate. A death event replaces that particle with a uniformly selected other particle; a birth event replaces a uniformly selected other particle with a copy of the current particle. Consequently events alter particle ancestry and multiplicity while the batch still contains the same number of particles.
 
+## Sampler state context: step 1
+
+After each sampler update, `SamplingPipeline` now passes a `SamplingContext` in `SamplingState.context`. It describes the noise level and coordinate system of the returned samples, independently of the timestep used as input to the update:
+
+| Sampler | Returned sample state | Coordinates |
+| --- | --- | --- |
+| DDPM / DDIM | `previous_timestep`; `None` for the clean final output | `x_t`; `clean_x0` at the endpoint |
+| Fixed-target Langevin | Its fixed `langevin_timestep` | `normalized_x_t` |
+| Annealed Langevin | The timestep used for the current update | `normalized_x_t` |
+
+This is context plumbing only. Birth-death still uses its existing fixed-target ULA metadata and remains enabled only with fixed-target Langevin. The destination-level context will let the next implementation step evaluate a time-dependent target at the level represented by the current particles; it does not yet define birth-death timing or change any sampling results.
+
 ## Rate and event rule
 
 For particle locations \(x_1,\dots,x_N\), estimate the current population density at each location with a Gaussian kernel estimate
@@ -86,7 +98,7 @@ BD can improve mixing or convergence of a particle approximation; this implement
 
 ## What is not implemented yet
 
-- **BD with DDPM, DDIM, or annealed Langevin:** these methods visit a sequence of changing noisy distributions. Applying a stationary-target BD rate would be unjustified without specifying the target density, the state coordinates, and how the BD time increment maps to each diffusion update.
+- **BD with DDPM, DDIM, or annealed Langevin:** `SamplingContext` now reports each sampler's returned state level and coordinates, but the BD modifier does not yet consume that context. We still need to define the target marginal for each intervention and the BD pseudo-time assigned to each reverse update or skipped interval.
 - **BD paired with a learned CIFAR-10/CelebA score model:** an epsilon model estimates a noisy score but does not provide the corresponding target log density needed by the rate. The empirical-data mode is separate: it uses both the subset mixture's score and density, not a pretrained model's score. Combining a learned score and subset density would need a justified consistency argument.
 - **Variable-size particle populations, GPU-optimized KDE, and dedicated BD diagnostics/benchmarks:** the current implementation intentionally uses fixed population and a transparent dense pairwise KDE suitable for small 2D experiments.
 - **A paper-exact reproduction:** integrator conventions, event scheduling, model parameters, and benchmark protocol still need to be aligned if the goal becomes reproducing the paper's quantitative experiments.

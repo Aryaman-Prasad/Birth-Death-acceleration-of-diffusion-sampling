@@ -99,4 +99,6 @@ class BirthDeathAcceleration(SamplingModifier):
             "birth_death_deaths": deaths,
             "birth_death_population": population,
         })
-        return SamplingState(updated, state.timestep, state.previous_timestep, metadata)
+        return SamplingState(
+            updated, state.timestep, state.previous_timestep, metadata, context=state.context
+        )
