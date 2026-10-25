@@ -71,7 +71,7 @@ def run_single_experiment(
     bd_every_k: int = 2,
     bd_total_time: float = 1.0,
     bd_bandwidth: float = 0.3,
-    fid_evaluator: FIDEvaluator | None = None,
+    real_images: torch.Tensor | None = None,
     fid_samples: int = 500,
     fid_batch_size: int = 64,
 ):
@@ -108,8 +108,12 @@ def run_single_experiment(
 
     # 2. FID evaluation (if requested)
     fid_score = None
-    if fid_evaluator is not None and fid_samples > 0:
-        fid_evaluator.reset_fake()
+    if real_images is not None and fid_samples > 0:
+        fid_evaluator = FIDEvaluator(device)
+        for start in range(0, real_images.shape[0], fid_batch_size):
+            chunk = real_images[start:start + fid_batch_size].to(device)
+            fid_evaluator.update_real(chunk)
+
         remaining = fid_samples
         fid_gen = torch.Generator(device=device).manual_seed(seed + 999)
         while remaining > 0:
@@ -252,21 +256,22 @@ def main():
     model = make_model("target-score", target=target, scheduler=scheduler).to(device)
     model.eval()
 
-    # Setup FID Evaluator with real images
-    fid_eval = None
+    # Setup Real Reference Images for FID
+    real_images = None
     if args.fid_samples > 0:
-        print(f"[+] Initializing FID evaluator with {args.fid_samples} real reference images...")
-        fid_eval = FIDEvaluator(device)
+        print(f"[+] Loading {args.fid_samples} real reference images for FID...")
         from torch.utils.data import DataLoader
         loader = DataLoader(dataset, batch_size=args.fid_batch_size, shuffle=True)
+        img_list = []
         accumulated = 0
         for batch in loader:
             imgs = batch[0] if isinstance(batch, (tuple, list)) else batch
             take = min(args.fid_samples - accumulated, imgs.shape[0])
-            fid_eval.update_real(imgs[:take])
+            img_list.append(imgs[:take])
             accumulated += take
             if accumulated >= args.fid_samples:
                 break
+        real_images = torch.cat(img_list, dim=0)
 
     # 2. Experiment Grid Configurations
     # We test:
@@ -342,7 +347,7 @@ def main():
             bd_every_k=c["k"],
             bd_total_time=c["tau"],
             bd_bandwidth=0.3,
-            fid_evaluator=fid_eval,
+            real_images=real_images,
             fid_samples=args.fid_samples,
             fid_batch_size=args.fid_batch_size,
         )
