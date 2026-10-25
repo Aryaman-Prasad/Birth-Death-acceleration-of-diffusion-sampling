@@ -258,7 +258,9 @@ def main():
         )
         rec["name"] = c["name"]
         results.append(rec)
-        cases_plot_data.append((c["name"], rec, samples))
+        # Exclude 5-step warmup from presentation scatter plots to prevent scale skew
+        if c["steps"] >= 10:
+            cases_plot_data.append((c["name"], rec, samples))
 
         bd_label = "YES" if rec["birth_death"] else "NO"
         cov_label = f"{int(rec['mode_coverage']*8)}/8"
@@ -282,7 +284,7 @@ def main():
     plot_toy_comparison(cases_plot_data, target, scatter_fig)
 
     barchart_fig = out_dir / "toy_metrics_barchart.png"
-    plot_toy_metrics_bar(results, barchart_fig)
+    plot_toy_metrics_bar([r for r in results if r["steps"] >= 10], barchart_fig)
 
     print(f"\n[+] All toy results & figures generated in: {out_dir.resolve()}/")
 

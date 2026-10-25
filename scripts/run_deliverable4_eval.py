@@ -153,8 +153,14 @@ def generate_presentation_plots(results: list[dict], output_dir: Path):
     out_plots = output_dir / "plots"
     out_plots.mkdir(parents=True, exist_ok=True)
 
-    # Plot 1: Speed vs Quality (Steps vs FID)
-    step_runs = [r for r in results if r.get("bd_every_k") in (None, 2) and r.get("bd_total_time") in (None, 0.01) and r.get("fid") is not None]
+    # Plot 1: Speed vs Quality (Steps vs FID) - exclude 5-step warmup to prevent skewing the scale
+    step_runs = [
+        r for r in results
+        if r["steps"] > 5
+        and r.get("bd_every_k") in (None, 2)
+        and r.get("bd_total_time") in (None, 0.01)
+        and r.get("fid") is not None
+    ]
     if len(step_runs) >= 4:
         plt.figure(figsize=(7, 4.5), dpi=150)
         baseline_steps = sorted([r for r in step_runs if not r["birth_death"]], key=lambda x: x["steps"])
@@ -194,10 +200,10 @@ def generate_presentation_plots(results: list[dict], output_dir: Path):
         plt.savefig(out_plots / "fig2_diversity_collapse.png")
         plt.close()
 
-    # Plot 3: Wall-Clock Latency Comparison
+    # Plot 3: Wall-Clock Latency Comparison (exclude 5-step warmup)
     plt.figure(figsize=(7, 4.5), dpi=150)
-    b_lat = [r for r in results if not r["birth_death"]]
-    bd_lat = [r for r in results if r["birth_death"]]
+    b_lat = [r for r in results if not r["birth_death"] and r["steps"] > 5]
+    bd_lat = [r for r in results if r["birth_death"] and r["steps"] > 5]
     if b_lat and bd_lat:
         b_avg = sum(r["seconds_per_sample"] for r in b_lat) / len(b_lat)
         bd_avg = sum(r["seconds_per_sample"] for r in bd_lat) / len(bd_lat)
