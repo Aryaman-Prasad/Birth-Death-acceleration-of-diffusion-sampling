@@ -224,12 +224,12 @@ def main():
 
     # Decisive comparison cases (including 5-step ultra-fast DDIM)
     configs = [
-        {"name": "DDIM 5 (Baseline)",     "steps": 5,  "bd": False, "k": 1, "tau": 0.0, "eta": 0.0},
-        {"name": "DDIM 5 + BD",           "steps": 5,  "bd": True,  "k": 1, "tau": 0.1, "eta": 0.0},
-        {"name": "DDIM 10 (Baseline)",    "steps": 10, "bd": False, "k": 1, "tau": 0.0, "eta": 0.0},
-        {"name": "DDIM 10 + Light BD",   "steps": 10, "bd": True,  "k": 2, "tau": 0.1, "eta": 0.0},
-        {"name": "DDIM 10 + Heavy BD",   "steps": 10, "bd": True,  "k": 1, "tau": 1.0, "eta": 0.0},
-        {"name": "DDIM 50 (Baseline)",    "steps": 50, "bd": False, "k": 1, "tau": 0.0, "eta": 0.0},
+        {"name": "DDIM 5 (Baseline)",     "steps": 5,  "bd": False, "k": 1, "tau": 0.0, "eta": 1.0},
+        {"name": "DDIM 5 + BD",           "steps": 5,  "bd": True,  "k": 1, "tau": 0.1, "eta": 1.0},
+        {"name": "DDIM 10 (Baseline)",    "steps": 10, "bd": False, "k": 1, "tau": 0.0, "eta": 1.0},
+        {"name": "DDIM 10 + Light BD",   "steps": 10, "bd": True,  "k": 2, "tau": 0.1, "eta": 1.0},
+        {"name": "DDIM 10 + Heavy BD",   "steps": 10, "bd": True,  "k": 1, "tau": 1.0, "eta": 1.0},
+        {"name": "DDIM 50 (Baseline)",    "steps": 50, "bd": False, "k": 1, "tau": 0.0, "eta": 1.0},
     ]
 
     print("\n" + "=" * 80)
