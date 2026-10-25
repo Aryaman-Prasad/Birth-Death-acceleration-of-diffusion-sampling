@@ -288,38 +288,38 @@ def main():
     if args.quick:
         cases = [
             # 5-step ultra-fast DDIM
-            {"name": "ddim_5_nobd",  "steps": 5,  "bd": False, "k": 1, "tau": 0.0,  "eta": 0.0},
-            {"name": "ddim_5_bd",    "steps": 5,  "bd": True,  "k": 1, "tau": 0.01, "eta": 0.0},
+            {"name": "ddim_5_nobd",  "steps": 5,  "bd": False, "k": 1, "tau": 0.0,  "eta": 1.0},
+            {"name": "ddim_5_bd",    "steps": 5,  "bd": True,  "k": 1, "tau": 0.01, "eta": 1.0},
             # 10-step DDIM
-            {"name": "ddim_10_nobd", "steps": 10, "bd": False, "k": 1, "tau": 0.0,  "eta": 0.0},
-            {"name": "ddim_10_bd",   "steps": 10, "bd": True,  "k": 2, "tau": 0.01, "eta": 0.0},
+            {"name": "ddim_10_nobd", "steps": 10, "bd": False, "k": 1, "tau": 0.0,  "eta": 1.0},
+            {"name": "ddim_10_bd",   "steps": 10, "bd": True,  "k": 2, "tau": 0.01, "eta": 1.0},
             # 25-step DDIM
-            {"name": "ddim_25_nobd", "steps": 25, "bd": False, "k": 1, "tau": 0.0,  "eta": 0.0},
-            {"name": "ddim_25_bd",   "steps": 25, "bd": True,  "k": 2, "tau": 0.01, "eta": 0.0},
+            {"name": "ddim_25_nobd", "steps": 25, "bd": False, "k": 1, "tau": 0.0,  "eta": 1.0},
+            {"name": "ddim_25_bd",   "steps": 25, "bd": True,  "k": 2, "tau": 0.01, "eta": 1.0},
             # Heavy BD collapse test
             {"name": "ddim_25_bd_heavy", "steps": 25, "bd": True, "k": 2, "tau": 1.0, "eta": 0.0},
         ]
     else:
         cases = [
             # A. Step comparison (5, 10, 25, 50 steps) Baseline vs BD
-            {"name": "ddim_5_baseline",  "steps": 5,  "bd": False, "k": 1, "tau": 0.0,  "eta": 0.0},
-            {"name": "ddim_5_bd",        "steps": 5,  "bd": True,  "k": 1, "tau": 0.01, "eta": 0.0},
-            {"name": "ddim_10_baseline", "steps": 10, "bd": False, "k": 1, "tau": 0.0,  "eta": 0.0},
-            {"name": "ddim_10_bd",       "steps": 10, "bd": True,  "k": 2, "tau": 0.01, "eta": 0.0},
-            {"name": "ddim_25_baseline", "steps": 25, "bd": False, "k": 1, "tau": 0.0,  "eta": 0.0},
-            {"name": "ddim_25_bd",       "steps": 25, "bd": True,  "k": 2, "tau": 0.01, "eta": 0.0},
-            {"name": "ddim_50_baseline", "steps": 50, "bd": False, "k": 1, "tau": 0.0,  "eta": 0.0},
-            {"name": "ddim_50_bd",       "steps": 50, "bd": True,  "k": 2, "tau": 0.01, "eta": 0.0},
+            {"name": "ddim_5_baseline",  "steps": 5,  "bd": False, "k": 1, "tau": 0.0,  "eta": 1.0},
+            {"name": "ddim_5_bd",        "steps": 5,  "bd": True,  "k": 1, "tau": 0.01, "eta": 1.0},
+            {"name": "ddim_10_baseline", "steps": 10, "bd": False, "k": 1, "tau": 0.0,  "eta": 1.0},
+            {"name": "ddim_10_bd",       "steps": 10, "bd": True,  "k": 2, "tau": 0.01, "eta": 1.0},
+            {"name": "ddim_25_baseline", "steps": 25, "bd": False, "k": 1, "tau": 0.0,  "eta": 1.0},
+            {"name": "ddim_25_bd",       "steps": 25, "bd": True,  "k": 2, "tau": 0.01, "eta": 1.0},
+            {"name": "ddim_50_baseline", "steps": 50, "bd": False, "k": 1, "tau": 0.0,  "eta": 1.0},
+            {"name": "ddim_50_bd",       "steps": 50, "bd": True,  "k": 2, "tau": 0.01, "eta": 1.0},
 
             # B. BD Pseudo-time Budget Ablation (steps=25, k=2)
-            {"name": "ablation_time_0.01", "steps": 25, "bd": True, "k": 2, "tau": 0.01, "eta": 0.0},
-            {"name": "ablation_time_0.10", "steps": 25, "bd": True, "k": 2, "tau": 0.10, "eta": 0.0},
-            {"name": "ablation_time_1.00", "steps": 25, "bd": True, "k": 2, "tau": 1.00, "eta": 0.0},
+            {"name": "ablation_time_0.01", "steps": 25, "bd": True, "k": 2, "tau": 0.01, "eta": 1.0},
+            {"name": "ablation_time_0.10", "steps": 25, "bd": True, "k": 2, "tau": 0.10, "eta": 1.0},
+            {"name": "ablation_time_1.00", "steps": 25, "bd": True, "k": 2, "tau": 1.00, "eta": 1.0},
 
             # C. Cadence Ablation (steps=25, tau=0.01)
-            {"name": "ablation_k_1", "steps": 25, "bd": True, "k": 1, "tau": 0.01, "eta": 0.0},
-            {"name": "ablation_k_2", "steps": 25, "bd": True, "k": 2, "tau": 0.01, "eta": 0.0},
-            {"name": "ablation_k_5", "steps": 25, "bd": True, "k": 5, "tau": 0.01, "eta": 0.0},
+            {"name": "ablation_k_1", "steps": 25, "bd": True, "k": 1, "tau": 0.01, "eta": 1.0},
+            {"name": "ablation_k_2", "steps": 25, "bd": True, "k": 2, "tau": 0.01, "eta": 1.0},
+            {"name": "ablation_k_5", "steps": 25, "bd": True, "k": 5, "tau": 0.01, "eta": 1.0},
 
             # D. Stochasticity Ablation
             {"name": "ablation_eta_0.0", "steps": 25, "bd": True, "k": 2, "tau": 0.01, "eta": 0.0},
