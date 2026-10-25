@@ -111,9 +111,11 @@ def run_toy_case(
 
 def plot_toy_comparison(cases_data, target, output_path: Path):
     """Generates 2D scatter plots of particles overlaid on target density contours."""
-    fig, axes = plt.subplots(1, len(cases_data), figsize=(4.5 * len(cases_data), 4.5), dpi=180)
-    if len(cases_data) == 1:
-        axes = [axes]
+    n_cases = len(cases_data)
+    ncols = math.ceil(n_cases / 2) if n_cases > 4 else n_cases
+    nrows = 2 if n_cases > 4 else 1
+    fig, axes = plt.subplots(nrows, ncols, figsize=(4.2 * ncols, 4.2 * nrows), dpi=180)
+    axes_flat = np.array(axes).flatten()
 
     # Precompute target density grid for background contour
     grid_range = 3.2
@@ -130,7 +132,8 @@ def plot_toy_comparison(cases_data, target, output_path: Path):
 
     centers = target_cpu.centers.numpy()
 
-    for ax, (title, record, samples) in zip(axes, cases_data):
+    for idx, (title, record, samples) in enumerate(cases_data):
+        ax = axes_flat[idx]
         # 1. Background target contour
         ax.contour(xx, yy, density, levels=7, cmap="Greys", alpha=0.45, linewidths=1.2)
         # 2. Mode centers
@@ -141,7 +144,7 @@ def plot_toy_comparison(cases_data, target, output_path: Path):
         ax.set_xlim(-grid_range, grid_range)
         ax.set_ylim(-grid_range, grid_range)
         ax.set_aspect("equal", "box")
-        ax.set_title(title, fontsize=12, fontweight="bold", pad=8)
+        ax.set_title(title, fontsize=11, fontweight="bold", pad=8)
         ax.grid(True, linestyle=":", alpha=0.4)
 
         # Annotations box
@@ -156,6 +159,10 @@ def plot_toy_comparison(cases_data, target, output_path: Path):
             fontsize=8.5, verticalalignment="bottom",
             bbox=dict(boxstyle="round,pad=0.35", facecolor="white", alpha=0.85, edgecolor="#cccccc")
         )
+
+    # Hide unused subplots
+    for idx in range(n_cases, len(axes_flat)):
+        axes_flat[idx].set_visible(False)
 
     plt.tight_layout()
     plt.savefig(output_path, bbox_inches="tight")
@@ -222,14 +229,17 @@ def main():
     ref_gen = torch.Generator(device=device).manual_seed(args.seed + 1)
     references = tbe._sample_target(target, max(args.count, 1024), ref_gen)
 
-    # Decisive comparison cases (including 5-step ultra-fast DDIM)
+    # Decisive comparison cases (including 5-step warmup, 10, 25, 50 steps with and without BD)
     configs = [
         {"name": "DDIM 5 (Baseline)",     "steps": 5,  "bd": False, "k": 1, "tau": 0.0, "eta": 1.0},
         {"name": "DDIM 5 + BD",           "steps": 5,  "bd": True,  "k": 1, "tau": 0.1, "eta": 1.0},
         {"name": "DDIM 10 (Baseline)",    "steps": 10, "bd": False, "k": 1, "tau": 0.0, "eta": 1.0},
         {"name": "DDIM 10 + Light BD",   "steps": 10, "bd": True,  "k": 2, "tau": 0.1, "eta": 1.0},
         {"name": "DDIM 10 + Heavy BD",   "steps": 10, "bd": True,  "k": 1, "tau": 1.0, "eta": 1.0},
+        {"name": "DDIM 25 (Baseline)",    "steps": 25, "bd": False, "k": 1, "tau": 0.0, "eta": 1.0},
+        {"name": "DDIM 25 + BD",          "steps": 25, "bd": True,  "k": 2, "tau": 0.1, "eta": 1.0},
         {"name": "DDIM 50 (Baseline)",    "steps": 50, "bd": False, "k": 1, "tau": 0.0, "eta": 1.0},
+        {"name": "DDIM 50 + BD",          "steps": 50, "bd": True,  "k": 2, "tau": 0.1, "eta": 1.0},
     ]
 
     print("\n" + "=" * 80)
