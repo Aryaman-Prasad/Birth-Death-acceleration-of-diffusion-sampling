@@ -269,9 +269,13 @@ def sample_main(argv=None):
     parser.add_argument("--langevin-initial-scale", type=float, default=1.0,
                         help="initial Gaussian scale for fixed-target langevin")
     parser.add_argument("--birth-death", action="store_true",
-                        help="enable fixed-population birth-death after each fixed-target ULA update")
+                        help="enable fixed-population birth-death between compatible sampler updates")
     parser.add_argument("--bd-kernel-bandwidth", type=float, default=0.3,
                         help="Gaussian KDE bandwidth for birth-death particle rates")
+    parser.add_argument("--bd-every-k", type=int, default=1,
+                        help="apply birth-death after every k sampler updates (default: 1)")
+    parser.add_argument("--bd-total-time", type=float, default=1.0,
+                        help="total birth-death pseudo-time budget divided over scheduled interventions")
     parser.add_argument("--toy-mixture-radius", type=float, default=2.0)
     parser.add_argument("--toy-mixture-standard-deviation", type=float, default=0.15)
     parser.add_argument("--count", type=int, default=16)
@@ -362,11 +366,25 @@ def sample_main(argv=None):
             raise ValueError(
                 "--birth-death requires --toy-mixture-oracle or --empirical-data-target with a known target density"
             )
-        if args.sampler not in {"langevin", "ula"}:
-            raise ValueError("--birth-death currently supports only the fixed-target --sampler langevin")
-        if args.count < 2:
+        if args.sampler not in {"ddpm", "ddim", "langevin", "ula"}:
+            raise ValueError(
+                "--birth-death supports ddpm, ddim, or fixed-target langevin; "
+                "annealed-langevin is not supported yet"
+            )
+        if args.count < 2 and not args.fid:
             raise ValueError("--birth-death requires --count of at least 2")
-        modifiers.append(BirthDeathAcceleration(target, args.bd_kernel_bandwidth))
+        if args.fid and (args.fid_batch_size < 2 or
+                         args.fid_samples % args.fid_batch_size == 1):
+            raise ValueError(
+                "--birth-death with --fid requires every generated batch to contain "
+                "at least 2 samples; adjust --fid-batch-size or --fid-samples"
+            )
+        modifiers.append(BirthDeathAcceleration(
+            target,
+            args.bd_kernel_bandwidth,
+            every_k_steps=args.bd_every_k,
+            total_time=args.bd_total_time,
+        ))
     pipeline = SamplingPipeline(sampler, scheduler, modifiers=modifiers)
     generator = torch.Generator(device=device).manual_seed(args.seed) if args.seed is not None else None
     sampler_steps = len(sampler.inference_timesteps(scheduler, args.steps, device))
@@ -397,6 +415,7 @@ def sample_main(argv=None):
     model_source = (
         f"checkpoint:{args.checkpoint}" if args.checkpoint else
         "toy-mixture-oracle" if args.toy_mixture_oracle else
+        f"empirical-data-target:{args.target_dataset}" if args.empirical_data_target else
         f"huggingface:{args.pretrained_model_id or DEFAULT_PRETRAINED_MODEL}"
     )
     metadata = {
@@ -419,9 +438,22 @@ def sample_main(argv=None):
     if args.birth_death:
         metadata.update({
             "birth_death_kernel_bandwidth": args.bd_kernel_bandwidth,
-            "toy_mixture_radius": args.toy_mixture_radius,
-            "toy_mixture_standard_deviation": args.toy_mixture_standard_deviation,
+            "birth_death_every_k_steps": args.bd_every_k,
+            "birth_death_total_time": args.bd_total_time,
         })
+        if args.toy_mixture_oracle:
+            metadata.update({
+                "toy_mixture_radius": args.toy_mixture_radius,
+                "toy_mixture_standard_deviation": args.toy_mixture_standard_deviation,
+            })
+        if args.empirical_data_target:
+            metadata.update({
+                "target_dataset": args.target_dataset,
+                "target_data_dir": args.target_data_dir,
+                "target_reference_count": args.target_reference_count,
+                "target_reference_seed": args.target_reference_seed,
+                "target_reference_chunk_size": args.target_reference_chunk_size,
+            })
     additional_metrics = None
     if args.fid:
         metadata.update({

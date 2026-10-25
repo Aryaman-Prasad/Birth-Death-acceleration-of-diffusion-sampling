@@ -6,7 +6,15 @@ import torch
 
 
 class TargetDistribution(ABC):
-    """A target density and score on the sampler's current state space."""
+    """A target density and score on a declared sampler state space.
+
+    Targets in this project currently use normalized noisy coordinates
+    ``z = x_t / sqrt(alpha_bar_t)``. A target defined in another coordinate
+    system should override this class attribute; sampling modifiers can then
+    convert the sampler state before evaluating its density.
+    """
+
+    state_coordinates = "normalized_x_t"
 
     @abstractmethod
     def log_prob(self, samples: torch.Tensor, timestep: int,

@@ -11,7 +11,7 @@ python3 train.py --dataset toy-images --toy-size 64 --image-size 16 --epochs 1 -
 
 # Framework guide
 
-This repository implements the standard diffusion training and sampling baseline, plus an annealed Langevin sampler and an experimental, fixed-target birth-death particle update. The code is split so models, data sources, noise schedules, samplers, and optional sampling-time methods can be extended independently.
+This repository implements the standard diffusion training and sampling baseline, plus an annealed Langevin sampler and an experimental birth-death particle modifier. The code is split so models, data sources, noise schedules, samplers, and optional sampling-time methods can be extended independently.
 
 ## Setup and running
 
@@ -111,7 +111,16 @@ python3 sample.py --toy-mixture-oracle --sampler langevin --steps 1000 --count 2
 python3 sample.py --toy-mixture-oracle --sampler langevin --steps 1000 --count 256 --birth-death --bd-kernel-bandwidth 0.3 --seed 7 --output samples/mixture-bd-ula.pt
 ```
 
-These commands use an analytic eight-mode Gaussian mixture, a matching exact epsilon predictor, and the same fixed-noise ULA updates; the second inserts birth-death resampling after each update. See [DOCS-BD.md](DOCS-BD.md) for the implemented rates, assumptions, limitations, and details on what is faithful to the paper. Birth-death is deliberately rejected for learned image models and for DDPM, DDIM, or annealed Langevin: those paths do not expose a justified stationary target log density in the current framework.
+These commands use an analytic eight-mode Gaussian mixture, a matching exact epsilon predictor, and the same fixed-noise ULA updates; the second inserts birth-death resampling after each update. See [DOCS-BD.md](DOCS-BD.md) for the implemented rates, assumptions, limitations, and details on what is faithful to the paper. BD is not enabled for standalone learned image models without a matching target log density or for annealed Langevin yet.
+
+BD can also be used between DDPM or DDIM updates when the sampler has a matching analytic toy target or empirical noised-data target. For example:
+
+```bash
+python3 sample.py --toy-mixture-oracle --timesteps 100 --sampler ddpm --birth-death --count 128 --seed 7 --output samples/mixture-bd-ddpm.pt
+python3 sample.py --toy-mixture-oracle --timesteps 100 --sampler ddim --steps 25 --birth-death --bd-every-k 2 --count 128 --seed 7 --output samples/mixture-bd-ddim.pt
+```
+
+This DDPM/DDIM composition is an experimental time-dependent extension, not covered by the paper's stationary Langevin theory. BD remains unavailable with standalone pretrained/checkpoint models unless a matching target density is supplied, and it is not enabled for annealed Langevin yet.
 
 The sample grid is saved under `samples/`. `--steps` selects reverse updates for DDIM and fixed Langevin, and noise levels for annealed Langevin; DDPM uses every training timestep. Each run prints and saves a metrics JSON sidecar next to the sample output. For example, `samples/sample.png` produces `samples/sample.metrics.json`; set `--metrics-output path/to/run.json` to choose another location.
 
@@ -200,4 +209,4 @@ src/diffusion/
 
 ## Birth-death implementation scope
 
-The birth-death method now runs as an optional `SamplingModifier` after fixed-target Langevin updates. In addition to the analytic toy target, `--empirical-data-target` constructs an exact Gaussian-mixture density and score from a seeded subset of a selected dataset. The subset density is a clear target for experiments but only approximates the full data distribution; small-subset KDE in image space may be poor. A pretrained DDPM model's score is not automatically consistent with this empirical target, so the empirical-target mode uses its own analytic score adapter. For the equations, commands, and limitations, see [DOCS-BD.md](DOCS-BD.md). Birth-death changes particle ancestry while preserving population size; this implementation does not remove Langevin time steps from a trajectory. Training never invokes it.
+The birth-death method runs as an optional `SamplingModifier` after fixed-target Langevin, DDPM, or DDIM updates when an analytic toy target or an empirical noised-data target supplies a compatible log density. For DDPM/DDIM, the modifier uses the destination timestep, converts states into the target's declared coordinates, applies a configurable cadence and total pseudo-time budget, and skips the clean endpoint. The empirical subset density is exact for the selected references but only approximates the full data distribution; small-subset KDE in image space may be poor. A pretrained DDPM model's score is not automatically consistent with this empirical target, so empirical-target mode uses its own analytic score adapter. For equations, commands, assumptions, and limitations, see [DOCS-BD.md](DOCS-BD.md). Birth-death changes particle ancestry while preserving population size; it does not itself remove sampler steps. Training never invokes it.

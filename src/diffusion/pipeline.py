@@ -1,5 +1,7 @@
 """Sampling orchestration: sampler updates composed with optional modifiers."""
 
+from dataclasses import replace
+
 import torch
 from torch import nn
 
@@ -23,14 +25,34 @@ class SamplingPipeline:
         self.scheduler.to(device)
         timesteps = self.sampler.inference_timesteps(self.scheduler, num_inference_steps, device)
         samples = self.sampler.initial_samples(shape, device, self.scheduler, timesteps, generator)
+
+        # Build the state descriptions up front. In addition to the destination
+        # level, modifiers need the trajectory position to implement cadence
+        # and divide a fixed intervention-time budget over actual calls.
+        steps = []
         for index, timestep_tensor in enumerate(timesteps):
             timestep = int(timestep_tensor.item())
             previous = int(timesteps[index + 1].item()) if index + 1 < len(timesteps) else -1
+            context = self.sampler.sampling_context(timestep, previous, self.scheduler)
+            steps.append((timestep, previous, context))
+        num_steps = len(steps)
+        has_clean_endpoint = bool(steps and steps[-1][2].is_clean_sample)
+        steps = [
+            (timestep, previous, replace(
+                context,
+                step_index=index,
+                num_steps=num_steps,
+                has_clean_endpoint=has_clean_endpoint,
+            ))
+            for index, (timestep, previous, context) in enumerate(steps)
+        ]
+
+        for timestep, previous, context in steps:
             samples = self.sampler.step(model, samples, timestep, previous, self.scheduler, generator)
             state = SamplingState(
                 samples, timestep, previous,
                 self.sampler.sampling_metadata(timestep, previous, self.scheduler),
-                context=self.sampler.sampling_context(timestep, previous, self.scheduler),
+                context=context,
             )
             for modifier in self.modifiers:
                 state = modifier.apply(state, model=model, scheduler=self.scheduler, generator=generator)

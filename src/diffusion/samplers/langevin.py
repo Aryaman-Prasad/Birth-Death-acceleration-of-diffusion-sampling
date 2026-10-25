@@ -64,11 +64,7 @@ class LangevinSampler(Sampler):
 
     def sampling_metadata(self, timestep: int, previous_timestep: int,
                           scheduler: NoiseScheduler) -> dict:
-        return {
-            "birth_death_delta_t": self.step_size,
-            "target_timestep": self.timestep,
-            "state_coordinates": "normalized_x_t",
-        }
+        return {"langevin_step_size": self.step_size}
 
     def sampling_context(self, timestep: int, previous_timestep: int,
                          scheduler: NoiseScheduler) -> SamplingContext:
