@@ -91,6 +91,14 @@ Event decisions and partner draws are sampled independently before applying the 
 
 These vector experiments run without external data downloads. DDPM uses all scheduler timesteps; choose a small `--timesteps` for a short toy run. DDIM can use a reduced number of sampler updates through `--steps`.
 
+`tests/toy_bd_experiment.py` is a repeatable end-to-end comparison runner for the analytic toy target. It can run DDPM, DDIM, or both with the same seed, each with and without BD:
+
+```bash
+python3 tests/toy_bd_experiment.py --sampler both --count 128 --steps 25 --timesteps 1000 --device cpu
+```
+
+It prints NFE, elapsed time, seconds per sample, clean-target negative log likelihood, multi-scale RBF MMD-squared against independent samples from the exact target, mode coverage, and mode-balance total variation. The clean-target NLL uses the analytic mixture at zero added noise; mode coverage counts how many of the eight known modes received at least one generated sample, and mode-balance TV compares nearest-mode frequencies with the uniform target weights. MMD-squared and mode metrics compare sample distributions; NLL is a complementary pointwise diagnostic. It saves generated tensors and a `metrics.json` report in `samples/toy-bd-experiment/` by default. These target-specific values are useful toy diagnostics, not general-purpose image metrics.
+
 ```bash
 # Analytic toy target, standard DDPM
 python3 sample.py --toy-mixture-oracle --timesteps 100 --sampler ddpm --birth-death --count 128 --seed 7 --output samples/mixture-bd-ddpm.pt
