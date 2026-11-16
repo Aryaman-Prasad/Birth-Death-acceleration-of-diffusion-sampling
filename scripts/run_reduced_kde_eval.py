@@ -59,6 +59,7 @@ def run_experiment_case(
     bd_mode: str = "none",  # "none", "pixel_kde", or "reduced_kde"
     kde_reduce: int = 25,
     cnn_backbone: str = "auto",
+    projection_method: str = "pca",
     bd_every_k: int = 2,
     bd_total_time: float = 0.01,
     bd_bandwidth: float = 0.3,
@@ -92,7 +93,7 @@ def run_experiment_case(
                 every_k_steps=bd_every_k,
                 total_time=bd_total_time,
                 backbone=cnn_backbone,
-                projection_method="pca",
+                projection_method=projection_method,
                 seed=seed,
             )
         )
@@ -343,6 +344,7 @@ def main():
             bd_mode=case["mode"],
             kde_reduce=args.kde_reduce,
             cnn_backbone=args.cnn_backbone,
+            projection_method=args.projection_method,
             bd_every_k=case["k"],
             bd_total_time=case["tau"],
             real_images=real_images,
@@ -373,11 +375,84 @@ def main():
     with open(json_file, "w") as f:
         json.dump(results, f, indent=2)
 
+    # 5. Generate Matplotlib Presentation Plots
+    try:
+        import matplotlib.pyplot as plt
+
+        plots_dir = out_dir / "plots"
+        plots_dir.mkdir(parents=True, exist_ok=True)
+
+        # Plot 1: FID Comparison across Steps
+        plt.figure(figsize=(7.5, 4.8), dpi=150)
+        for mode, label, color, style in [
+            ("none", "Baseline DDIM (No BD)", "#1f77b4", "o-"),
+            ("pixel_kde", "High-Dim Pixel-KDE BD", "#d62728", "s--"),
+            ("reduced_kde", f"Reduced-KDE BD (dim={args.kde_reduce})", "#2ca02c", "^-"),
+        ]:
+            pts = [r for r in results if r["bd_mode"] == mode and r.get("fid") is not None]
+            if pts:
+                pts_sorted = sorted(pts, key=lambda x: x["steps"])
+                plt.plot(
+                    [p["steps"] for p in pts_sorted],
+                    [p["fid"] for p in pts_sorted],
+                    style,
+                    label=label,
+                    color=color,
+                    linewidth=2,
+                    markersize=7,
+                )
+
+        plt.xlabel("Inference Steps", fontsize=11)
+        plt.ylabel("FID Score (Lower is Better)", fontsize=11)
+        plt.title(
+            f"Sample Quality: Baseline vs. Pixel-KDE vs. Reduced-KDE ({args.dataset.upper()})",
+            fontsize=12,
+            fontweight="bold",
+        )
+        plt.grid(True, linestyle="--", alpha=0.5)
+        plt.legend(frameon=True)
+        plt.tight_layout()
+        plt.savefig(plots_dir / "fig1_steps_vs_fid.png")
+        plt.close()
+
+        # Plot 2: Unique Particle Fraction (Diversity)
+        plt.figure(figsize=(7.5, 4.5), dpi=150)
+        modes = ["Baseline", "Pixel-KDE", f"Reduced-KDE (d={args.kde_reduce})"]
+        uniques = []
+        for mode in ("none", "pixel_kde", "reduced_kde"):
+            matching = [
+                r["unique_fraction"]
+                for r in results
+                if r["bd_mode"] == mode and r["steps"] == 25
+            ]
+            uniques.append(matching[0] if matching else 1.0)
+
+        plt.bar(modes, uniques, color=["#1f77b4", "#d62728", "#2ca02c"], width=0.45)
+        plt.axhline(1.0, linestyle=":", color="gray", label="Ideal Diversity (1.0)")
+        plt.ylabel("Unique Particle Fraction", fontsize=11)
+        plt.title(
+            "Population Diversity (Unique Fraction at 25 Steps)",
+            fontsize=12,
+            fontweight="bold",
+        )
+        plt.ylim(0, 1.15)
+        plt.grid(axis="y", linestyle="--", alpha=0.5)
+        plt.legend(loc="lower right")
+        plt.tight_layout()
+        plt.savefig(plots_dir / "fig2_diversity_comparison.png")
+        plt.close()
+
+        print(f"[+] Saved presentation plots to: {plots_dir}/")
+    except Exception as e:
+        print(f"[!] Plot generation note: {e}")
+
     print("\n" + "=" * 80)
     print(f"[+] Benchmark Complete! Results saved to:")
     print(f"    - CSV:  {csv_file}")
     print(f"    - JSON: {json_file}")
     print(f"    - Grids: {samples_dir}/")
+    if (out_dir / "plots").exists():
+        print(f"    - Plots: {out_dir / 'plots'}/")
     print("=" * 80)
 
 
