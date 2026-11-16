@@ -197,6 +197,12 @@ def main():
         help="Compressed feature dimension for Reduced-KDE (default: 25)",
     )
     parser.add_argument(
+        "--cnn-backbone",
+        choices=("auto", "vgg16", "resnet18", "convnet"),
+        default="auto",
+        help="Pretrained CNN backbone for feature extraction (default: auto)",
+    )
+    parser.add_argument(
         "--projection-method",
         choices=("pca", "orthogonal", "linear", "mlp"),
         default="pca",
