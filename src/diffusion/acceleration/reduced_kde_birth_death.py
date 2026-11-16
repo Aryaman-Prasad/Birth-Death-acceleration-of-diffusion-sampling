@@ -164,6 +164,7 @@ class FeatureReducer(nn.Module):
 
     def fit_pca(self, reference_samples: torch.Tensor):
         """Fit PCA projection matrix on real reference samples once."""
+        self.to(device=reference_samples.device)
         with torch.no_grad():
             ref_raw = self._extract_raw(reference_samples)  # (M, raw_dim)
             mean = ref_raw.mean(dim=0, keepdim=True)
@@ -178,11 +179,14 @@ class FeatureReducer(nn.Module):
             self.register_buffer("pca_stds", stds)
             self.is_pca_fitted = True
 
-    def _extract_raw(self, x: torch.Tensor) -> torch.Tensor:
-        """Extract high-dimensional raw CNN features."""
+    def _extract_raw(self, x: torch.Tensor, chunk_size: int = 32) -> torch.Tensor:
+        """Extract high-dimensional raw CNN features, chunked to prevent OOM."""
         if x.ndim == 2:
             # Already flat vector data
             return x
+
+        # Ensure trunk is on the same device and dtype as input
+        self.trunk.to(device=x.device, dtype=x.dtype)
 
         # Ensure 3-channel image
         if x.shape[1] == 1:
@@ -196,6 +200,13 @@ class FeatureReducer(nn.Module):
         std = self.imagenet_std.to(device=x.device, dtype=x.dtype)
         x_norm = (x_01 - mean) / std
 
+        # Chunk large batches (e.g. references) to prevent activation OOM
+        if x_norm.shape[0] > chunk_size:
+            chunks = []
+            for start in range(0, x_norm.shape[0], chunk_size):
+                chunks.append(self.trunk(x_norm[start : start + chunk_size]))
+            return torch.cat(chunks, dim=0)
+
         return self.trunk(x_norm)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
@@ -204,6 +215,7 @@ class FeatureReducer(nn.Module):
             # Low-dimensional vector data (e.g. 2D toy mixture)
             return x
 
+        self.to(device=x.device)
         raw = self._extract_raw(x)
         if self.projection_method in ("linear", "mlp") and self.nn_head is not None:
             self.nn_head.to(device=raw.device, dtype=raw.dtype)
@@ -275,6 +287,7 @@ class ReducedKDEBirthDeathAcceleration(SamplingModifier):
         if hasattr(target, "reference_samples") and target.reference_samples is not None:
             refs = target.reference_samples
             if refs.ndim >= 3:
+                self.feature_reducer.to(device=refs.device)
                 self.feature_reducer.fit_pca(refs)
 
     def _target_coordinates(
