@@ -181,7 +181,7 @@ def parse_args(argv=None):
     )
     parser.add_argument(
         "--cnn-backbone",
-        choices=("auto", "vgg16", "resnet18", "convnet"),
+        choices=("auto", "vgg16", "resnet18", "mobilenet", "convnet"),
         default="auto",
         help="pretrained CNN backbone for feature extraction (default: auto)",
     )

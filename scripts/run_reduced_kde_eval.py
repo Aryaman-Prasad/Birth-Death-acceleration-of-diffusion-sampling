@@ -60,6 +60,7 @@ def run_experiment_case(
     kde_reduce: int = 25,
     cnn_backbone: str = "auto",
     projection_method: str = "pca",
+    noise_references: bool = True,
     bd_every_k: int = 2,
     bd_total_time: float = 0.01,
     bd_bandwidth: float = 0.3,
@@ -94,6 +95,7 @@ def run_experiment_case(
                 total_time=bd_total_time,
                 backbone=cnn_backbone,
                 projection_method=projection_method,
+                noise_references=noise_references,
                 seed=seed,
             )
         )
@@ -198,15 +200,21 @@ def main():
     )
     parser.add_argument(
         "--cnn-backbone",
-        choices=("auto", "vgg16", "resnet18", "convnet"),
+        choices=("auto", "vgg16", "resnet18", "mobilenet", "convnet"),
         default="auto",
-        help="Pretrained CNN backbone for feature extraction (default: auto)",
+        help="Pretrained CNN backbone: auto, vgg16, resnet18, mobilenet, convnet (default: auto)",
     )
     parser.add_argument(
         "--projection-method",
         choices=("pca", "orthogonal", "linear", "mlp"),
         default="pca",
         help="compression method: pca, orthogonal, linear (nn.Linear), or mlp (nn.Sequential)",
+    )
+    parser.add_argument(
+        "--noise-references",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="whether to re-noise references at each step (pass --no-noise-references for 10x faster caching)",
     )
     args = parser.parse_args()
 
@@ -351,6 +359,7 @@ def main():
             kde_reduce=args.kde_reduce,
             cnn_backbone=args.cnn_backbone,
             projection_method=args.projection_method,
+            noise_references=args.noise_references,
             bd_every_k=case["k"],
             bd_total_time=case["tau"],
             real_images=real_images,

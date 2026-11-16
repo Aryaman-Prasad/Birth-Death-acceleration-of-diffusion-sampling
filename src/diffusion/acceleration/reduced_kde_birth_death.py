@@ -147,6 +147,15 @@ class FeatureReducer(nn.Module):
             except Exception:
                 pass
 
+        if backbone in ("mobilenet", "mobilenet_v3"):
+            try:
+                import torchvision.models as tv_models
+                mb = tv_models.mobilenet_v3_small(weights=tv_models.MobileNet_V3_Small_Weights.DEFAULT)
+                trunk = nn.Sequential(mb.features, nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten())
+                return trunk, 576
+            except Exception:
+                pass
+
         # Standalone lightweight ConvNet (zero dependencies, completely offline)
         return LightweightConvTrunk(in_channels=3, out_dim=512), 512
 
@@ -275,6 +284,7 @@ class ReducedKDEBirthDeathAcceleration(SamplingModifier):
         self.every_k_steps = int(every_k_steps)
         self.total_time = float(total_time)
         self.noise_references = bool(noise_references)
+        self.cached_ref_features = None
 
         self.feature_reducer = FeatureReducer(
             reduced_dim=self.reduced_dim,
@@ -371,7 +381,12 @@ class ReducedKDEBirthDeathAcceleration(SamplingModifier):
                 noisy_refs = refs + sigma * ref_noise
                 ref_features = self.feature_reducer(noisy_refs)
             else:
-                ref_features = self.feature_reducer(refs)
+                if (
+                    self.cached_ref_features is None
+                    or self.cached_ref_features.device != samples.device
+                ):
+                    self.cached_ref_features = self.feature_reducer(refs)
+                ref_features = self.cached_ref_features
 
             ref_dist_sq = torch.cdist(particle_features, ref_features).square()
             log_kernel_ref = -0.5 * ref_dist_sq / (self.kernel_bandwidth**2)
