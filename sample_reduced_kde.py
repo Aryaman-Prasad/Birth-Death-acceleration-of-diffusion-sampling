@@ -10,6 +10,7 @@ feature space (e.g. 25 dims) using a CNN backbone before evaluating population K
 """
 
 import argparse
+import json
 import math
 import sys
 from pathlib import Path
@@ -384,11 +385,13 @@ def main(argv=None):
             "seconds_per_sample": metrics.seconds_per_sample,
             "unique_fraction": unique_ratio,
             "kde_reduce": args.kde_reduce,
-            "cnn_backbone": args.cnn_backbone,
+            "unet_layer": args.cnn_backbone,
             "projection_method": args.projection_method,
             "birth_death": args.birth_death,
         }
-        write_metrics(args.metrics_output, metrics_dict, {})
+        out_metrics = Path(args.metrics_output)
+        out_metrics.parent.mkdir(parents=True, exist_ok=True)
+        out_metrics.write_text(json.dumps(metrics_dict, indent=2) + "\n", encoding="utf-8")
         print(f"[+] Saved metrics to {args.metrics_output}")
 
 
