@@ -180,10 +180,12 @@ def parse_args(argv=None):
         help="target compressed feature dimension for KDE (default: 25, much smaller than 3072)",
     )
     parser.add_argument(
+        "--unet-layer",
+        "--unet-backbone",
         "--cnn-backbone",
-        choices=("auto", "vgg16", "resnet18", "mobilenet", "convnet"),
-        default="auto",
-        help="pretrained CNN backbone for feature extraction (default: auto)",
+        dest="cnn_backbone",
+        default="bottleneck",
+        help="DDPM U-Net encoder/bottleneck layer (< 1024 dims) for feature extraction: bottleneck (128D), down_block2 (128D), down_block1 (64D), auto (default: bottleneck)",
     )
     parser.add_argument(
         "--projection-method",
@@ -232,8 +234,8 @@ def main(argv=None):
     device = _device(args.device)
 
     print(
-        f"[+] Reduced-KDE Sampler: --kde_reduce={args.kde_reduce} "
-        f"backbone={args.cnn_backbone} proj={args.projection_method}"
+        f"[+] DDPM U-Net Reduced-KDE Sampler: --kde_reduce={args.kde_reduce} "
+        f"unet_layer={args.cnn_backbone} proj={args.projection_method}"
     )
 
     target = None

@@ -59,6 +59,7 @@ def run_benchmark(
         print(f"Loading checkpoint from {checkpoint}...")
         model, scheduler, config, _ = load_checkpoint(checkpoint, device)
         sample_shape = _get_sample_shape(model, config)
+    else:
         model_id = pretrained_model_id or DEFAULT_PRETRAINED_MODEL
         print(f"Loading pretrained model: {model_id}...")
         model = make_model(

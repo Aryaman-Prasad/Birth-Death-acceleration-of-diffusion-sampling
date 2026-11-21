@@ -1,16 +1,16 @@
-"""Low-dimensional feature-space birth-death particle updates.
+"""Low-dimensional DDPM U-Net feature-space birth-death particle updates.
 
 Computes KDE and target density in a compressed semantic feature space
-(e.g., dimension 25 instead of pixel dimension 3072 or 196608) using a
-pretrained CNN backbone (VGG-16, ResNet-18, or ConvNet) and PCA / orthogonal
+(e.g., dimension 128 or 25 instead of pixel dimension 3072 or 196608) using the
+native DDPM U-Net encoder/bottleneck layers (< 1024 dimensions) and PCA / orthogonal
 projection.
 
 In high-dimensional pixel space (d >= 32, d = 3072, d = 196608), standard Gaussian
 KDE suffers from curse-of-dimensionality self-domination: the self-kernel mass
 is ~1.0 for every particle, meaning the KDE conveys zero density information and
-BD degenerates into mode collapse. Compressing images into a semantic 25-dimensional
-feature space restores meaningful neighborhood overlap, rank correlation with the
-data distribution, and healthy particle diversity.
+BD degenerates into mode collapse. Extracting features from the DDPM U-Net's own
+encoder/bottleneck layers (< 1024 dims) provides noise-aware, semantic representations
+that restore meaningful neighborhood overlap and healthy particle diversity.
 """
 
 import math
@@ -19,49 +19,137 @@ from typing import Any
 
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 from diffusion.acceleration.base import SamplingModifier, SamplingState
+from diffusion.models.time_embedding import SinusoidalTimeEmbedding
+from diffusion.models.unet import ResidualBlock
 from diffusion.sampling import SamplingContext
 from diffusion.targets.base import TargetDistribution
 
 
-class LightweightConvTrunk(nn.Module):
-    """Self-contained convolutional feature trunk (always available offline)."""
+class DDPMUNetEncoderTrunk(nn.Module):
+    """Native DDPM U-Net encoder and bottleneck feature trunk (dimension < 1024).
 
-    def __init__(self, in_channels: int = 3, out_dim: int = 512):
+    Extracts time-conditioned latent representations directly from the DDPM
+    U-Net architecture, completely replacing external ImageNet-trained classifiers
+    (ResNet, VGG, MobileNet).
+
+    Supported layer outputs:
+    - 'bottleneck' (default): Output of middle blocks, pooled to 128D (< 1024).
+    - 'down_block2' / 'deep_encoder': Output of deepest downsampling stage (128D).
+    - 'down_block1': Output of first encoder stage (64D).
+    """
+
+    def __init__(
+        self,
+        image_channels: int = 3,
+        base_channels: int = 64,
+        time_channels: int = 256,
+        layer: str = "bottleneck",
+        checkpoint_path: str | None = None,
+    ):
         super().__init__()
-        self.net = nn.Sequential(
-            nn.Conv2d(in_channels, 64, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(64),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
-            nn.Conv2d(64, 128, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(128),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
-            nn.Conv2d(128, 256, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(256),
-            nn.ReLU(inplace=True),
-            nn.MaxPool2d(2, 2),
-            nn.Conv2d(256, out_dim, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(out_dim),
-            nn.ReLU(inplace=True),
-            nn.AdaptiveAvgPool2d((1, 1)),
-            nn.Flatten(),
+        self.layer = layer.lower()
+        self.base_channels = base_channels
+
+        # DDPM time conditioning MLP
+        self.time_mlp = nn.Sequential(
+            SinusoidalTimeEmbedding(base_channels),
+            nn.Linear(base_channels, time_channels),
+            nn.SiLU(),
+            nn.Linear(time_channels, time_channels),
         )
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        return self.net(x)
+        # DDPM U-Net Encoder Layers
+        self.input_conv = nn.Conv2d(image_channels, base_channels, 3, padding=1)
+        self.down_block1 = ResidualBlock(base_channels, base_channels, time_channels)  # 64 ch
+        self.downsample = nn.Conv2d(base_channels, base_channels, 3, stride=2, padding=1)
+        self.down_block2 = ResidualBlock(base_channels, base_channels * 2, time_channels)  # 128 ch
+        self.middle1 = ResidualBlock(base_channels * 2, base_channels * 2, time_channels)   # 128 ch
+        self.middle2 = ResidualBlock(base_channels * 2, base_channels * 2, time_channels)   # 128 ch
+
+        # Global average pool: reduces (B, C, H, W) -> (B, C) where C < 1024
+        self.pool = nn.AdaptiveAvgPool2d((1, 1))
+
+        # Determine output feature dimension
+        if self.layer in ("down_block1", "first_encoder"):
+            self.out_dim = base_channels  # 64 dims
+        else:
+            self.out_dim = base_channels * 2  # 128 dims for bottleneck and down_block2
+
+        if checkpoint_path is not None:
+            self.load_checkpoint(checkpoint_path)
+
+    def load_checkpoint(self, path: str):
+        """Loads weights from a trained SimpleUNet or framework checkpoint."""
+        ckpt = Path(path)
+        if not ckpt.exists():
+            return
+        state = torch.load(str(ckpt), map_location="cpu")
+        weights = state.get("model", state)
+        filtered = {}
+        for k, v in weights.items():
+            if k.startswith("input."):
+                filtered[k.replace("input.", "input_conv.")] = v
+            elif any(k.startswith(prefix) for prefix in (
+                "time_mlp.", "input_conv.", "down_block1.", "downsample.",
+                "down_block2.", "middle1.", "middle2."
+            )):
+                filtered[k] = v
+        if filtered:
+            self.load_state_dict(filtered, strict=False)
+
+    def load_from_unet(self, unet_model: nn.Module):
+        """Copies encoder weights directly from an active SimpleUNet instance."""
+        target_dict = self.state_dict()
+        source_dict = unet_model.state_dict()
+        transferred = {}
+        for k, v in source_dict.items():
+            mapped_k = k.replace("input.", "input_conv.") if k.startswith("input.") else k
+            if mapped_k in target_dict and target_dict[mapped_k].shape == v.shape:
+                transferred[mapped_k] = v
+        if transferred:
+            self.load_state_dict(transferred, strict=False)
+
+    def forward(
+        self, x: torch.Tensor, timesteps: torch.Tensor | int | None = None
+    ) -> torch.Tensor:
+        # Build timestep tensor
+        if timesteps is None:
+            ts = torch.zeros(x.shape[0], dtype=torch.long, device=x.device)
+        elif isinstance(timesteps, int):
+            ts = torch.full((x.shape[0],), timesteps, dtype=torch.long, device=x.device)
+        elif timesteps.ndim == 0:
+            ts = timesteps.repeat(x.shape[0]).to(dtype=torch.long, device=x.device)
+        else:
+            ts = timesteps.to(dtype=torch.long, device=x.device)
+            if ts.shape[0] != x.shape[0]:
+                ts = ts[0].repeat(x.shape[0])
+
+        t = self.time_mlp(ts)
+        h = self.down_block1(self.input_conv(x), t)
+        if self.layer in ("down_block1", "first_encoder"):
+            return self.pool(h).flatten(1)
+
+        h = self.down_block2(self.downsample(h), t)
+        if self.layer in ("down_block2", "deep_encoder"):
+            return self.pool(h).flatten(1)
+
+        # Bottleneck (middle block)
+        h = self.middle2(self.middle1(h, t), t)
+        return self.pool(h).flatten(1)  # shape: (B, 128) - strictly < 1024 dims
 
 
 class FeatureReducer(nn.Module):
-    """Extracts CNN features from images and compresses them to a low dimension (e.g. 25)."""
+    """Extracts DDPM U-Net encoder features (< 1024 dims) and compresses them (e.g. to 25 dims)."""
 
     def __init__(
         self,
         reduced_dim: int = 25,
         backbone: str = "auto",
         projection_method: str = "pca",
+        checkpoint_path: str | None = None,
         seed: int = 42,
     ):
         super().__init__()
@@ -72,20 +160,26 @@ class FeatureReducer(nn.Module):
         self.projection_method = projection_method
         self.seed = seed
 
-        self.trunk, self.raw_dim = self._build_trunk(backbone)
+        # Map layer choice
+        layer = "bottleneck"
+        if backbone in ("down_block1", "down_block2", "bottleneck"):
+            layer = backbone
+        elif backbone in ("convnet", "resnet18", "vgg16", "mobilenet", "mobilenet_v3", "auto"):
+            # Cleanly replace external CNN classification backbones with U-Net bottleneck
+            layer = "bottleneck"
+
+        # Native DDPM U-Net encoder trunk (< 1024 dimensions)
+        self.trunk = DDPMUNetEncoderTrunk(
+            image_channels=3,
+            base_channels=64,
+            time_channels=256,
+            layer=layer,
+            checkpoint_path=checkpoint_path,
+        )
+        self.raw_dim = self.trunk.out_dim  # 128 dimensions (< 1024)
         self.trunk.eval()
         for param in self.trunk.parameters():
             param.requires_grad = False
-
-        # ImageNet normalization statistics
-        self.register_buffer(
-            "imagenet_mean",
-            torch.tensor([0.485, 0.456, 0.406]).view(1, 3, 1, 1),
-        )
-        self.register_buffer(
-            "imagenet_std",
-            torch.tensor([0.229, 0.224, 0.225]).view(1, 3, 1, 1),
-        )
 
         # Initialize fixed orthogonal projection as fallback
         self._init_orthogonal(self.raw_dim, self.reduced_dim, seed=seed)
@@ -99,7 +193,7 @@ class FeatureReducer(nn.Module):
                 p.requires_grad = False
         elif self.projection_method == "mlp":
             torch.manual_seed(seed)
-            hidden_dim = max(self.reduced_dim * 2, 128)
+            hidden_dim = max(self.reduced_dim * 2, 64)
             self.nn_head = nn.Sequential(
                 nn.Linear(self.raw_dim, hidden_dim),
                 nn.ReLU(inplace=True),
@@ -110,72 +204,22 @@ class FeatureReducer(nn.Module):
         else:
             self.nn_head = None
 
-    def _build_trunk(self, backbone: str) -> tuple[nn.Module, int]:
-        """Constructs the feature extractor backbone with fail-safe fallbacks."""
-        if backbone in ("vgg16", "auto"):
-            try:
-                import torchvision.models as tv_models
-                cache_ckpt = (
-                    Path.home()
-                    / ".cache"
-                    / "torch"
-                    / "hub"
-                    / "checkpoints"
-                    / "vgg16-397923af.pth"
-                )
-                if cache_ckpt.exists():
-                    vgg = tv_models.vgg16(weights=None)
-                    state = torch.load(str(cache_ckpt), map_location="cpu")
-                    vgg.load_state_dict(state)
-                else:
-                    vgg = tv_models.vgg16(weights=tv_models.VGG16_Weights.DEFAULT)
-                trunk = nn.Sequential(
-                    vgg.features,
-                    nn.AdaptiveAvgPool2d((1, 1)),
-                    nn.Flatten(),
-                )
-                return trunk, 512
-            except Exception:
-                if backbone == "vgg16":
-                    pass  # Fall through to lightweight ConvNet if torchvision fails
-        if backbone == "resnet18":
-            try:
-                import torchvision.models as tv_models
-                resnet = tv_models.resnet18(weights=tv_models.ResNet18_Weights.DEFAULT)
-                trunk = nn.Sequential(*list(resnet.children())[:-1], nn.Flatten())
-                return trunk, 512
-            except Exception:
-                pass
-
-        if backbone in ("mobilenet", "mobilenet_v3"):
-            try:
-                import torchvision.models as tv_models
-                mb = tv_models.mobilenet_v3_small(weights=tv_models.MobileNet_V3_Small_Weights.DEFAULT)
-                trunk = nn.Sequential(mb.features, nn.AdaptiveAvgPool2d((1, 1)), nn.Flatten())
-                return trunk, 576
-            except Exception:
-                pass
-
-        # Standalone lightweight ConvNet (zero dependencies, completely offline)
-        return LightweightConvTrunk(in_channels=3, out_dim=512), 512
-
     def _init_orthogonal(self, in_dim: int, out_dim: int, seed: int):
         gen = torch.Generator().manual_seed(seed)
         k = min(in_dim, out_dim)
         random_mat = torch.randn(in_dim, k, generator=gen)
         q, _ = torch.linalg.qr(random_mat)
         if out_dim > in_dim:
-            # Pad with zeros if requested dimension is larger than input
             padded = torch.zeros(in_dim, out_dim)
             padded[:, :k] = q
             q = padded
         self.register_buffer("ortho_proj", q)
 
-    def fit_pca(self, reference_samples: torch.Tensor):
+    def fit_pca(self, reference_samples: torch.Tensor, timesteps: Any = 0):
         """Fit PCA projection matrix on real reference samples once."""
         self.to(device=reference_samples.device)
         with torch.no_grad():
-            ref_raw = self._extract_raw(reference_samples)  # (M, raw_dim)
+            ref_raw = self._extract_raw(reference_samples, timesteps=timesteps)  # (M, raw_dim)
             mean = ref_raw.mean(dim=0, keepdim=True)
             centered = ref_raw - mean
             # SVD on centered features
@@ -188,13 +232,13 @@ class FeatureReducer(nn.Module):
             self.register_buffer("pca_stds", stds)
             self.is_pca_fitted = True
 
-    def _extract_raw(self, x: torch.Tensor, chunk_size: int = 32) -> torch.Tensor:
-        """Extract high-dimensional raw CNN features, chunked to prevent OOM."""
+    def _extract_raw(
+        self, x: torch.Tensor, timesteps: Any = None, chunk_size: int = 64
+    ) -> torch.Tensor:
+        """Extract DDPM U-Net encoder/bottleneck features (< 1024 dims)."""
         if x.ndim == 2:
-            # Already flat vector data
             return x
 
-        # Ensure trunk is on the same device and dtype as input
         self.trunk.to(device=x.device, dtype=x.dtype)
 
         # Ensure 3-channel image
@@ -203,29 +247,30 @@ class FeatureReducer(nn.Module):
         elif x.shape[1] > 3:
             x = x[:, :3]
 
-        # Rescale [-1, 1] to [0, 1] then ImageNet normalize
-        x_01 = (x.clamp(-1.0, 1.0) + 1.0) * 0.5
-        mean = self.imagenet_mean.to(device=x.device, dtype=x.dtype)
-        std = self.imagenet_std.to(device=x.device, dtype=x.dtype)
-        x_norm = (x_01 - mean) / std
+        # Standard diffusion image normalization [-1, 1]
+        x_norm = x.clamp(-1.0, 1.0)
 
-        # Chunk large batches (e.g. references) to prevent activation OOM
+        # Chunk large batches to bound activation memory
         if x_norm.shape[0] > chunk_size:
             chunks = []
             for start in range(0, x_norm.shape[0], chunk_size):
-                chunks.append(self.trunk(x_norm[start : start + chunk_size]))
+                sub_x = x_norm[start : start + chunk_size]
+                chunks.append(self.trunk(sub_x, timesteps=timesteps))
             return torch.cat(chunks, dim=0)
 
-        return self.trunk(x_norm)
+        return self.trunk(x_norm, timesteps=timesteps)
 
-    def forward(self, x: torch.Tensor) -> torch.Tensor:
-        """Projects input images or vectors to the reduced_dim feature space."""
+    def forward(
+        self, x: torch.Tensor, timesteps: torch.Tensor | int | None = None
+    ) -> torch.Tensor:
+        """Projects input images or vectors to the reduced_dim feature space (< 1024)."""
         if x.ndim == 2 and x.shape[1] <= self.reduced_dim:
             # Low-dimensional vector data (e.g. 2D toy mixture)
             return x
 
         self.to(device=x.device)
-        raw = self._extract_raw(x)
+        raw = self._extract_raw(x, timesteps=timesteps)  # (N, raw_dim) where raw_dim = 128 < 1024
+
         if self.projection_method in ("linear", "mlp") and self.nn_head is not None:
             self.nn_head.to(device=raw.device, dtype=raw.dtype)
             return self.nn_head(raw)
@@ -241,19 +286,18 @@ class FeatureReducer(nn.Module):
         # Fallback to orthogonal projection
         ortho = self.ortho_proj.to(device=raw.device, dtype=raw.dtype)
         if raw.shape[1] != ortho.shape[0]:
-            # Vector input dimension mismatch: adaptively project
             k = min(raw.shape[1], self.reduced_dim)
             return raw[:, :k]
         return raw @ ortho
 
 
 class ReducedKDEBirthDeathAcceleration(SamplingModifier):
-    """Fixed-population birth-death particle updates using reduced-dimensional KDE.
+    """Fixed-population birth-death particle updates using DDPM U-Net latent features.
 
-    Compresses particle population and reference target into a low-dimensional
-    semantic space (default: 25 dims) via a pretrained CNN backbone and PCA.
-    This resolves the curse of dimensionality and self-domination that plagues
-    pixel-space KDE on image datasets.
+    Compresses particle population and reference target into a compact semantic
+    space (< 1024 dims, default: 25 dims) via DDPM U-Net encoder/bottleneck features
+    and PCA projection. This eliminates the curse of dimensionality and distance
+    concentration without relying on external classification backbones.
     """
 
     def __init__(
@@ -267,6 +311,7 @@ class ReducedKDEBirthDeathAcceleration(SamplingModifier):
         backbone: str = "auto",
         projection_method: str = "pca",
         noise_references: bool = True,
+        checkpoint_path: str | None = None,
         seed: int = 42,
     ):
         if kernel_bandwidth <= 0:
@@ -290,6 +335,7 @@ class ReducedKDEBirthDeathAcceleration(SamplingModifier):
             reduced_dim=self.reduced_dim,
             backbone=backbone,
             projection_method=projection_method,
+            checkpoint_path=checkpoint_path,
             seed=seed,
         )
 
@@ -298,7 +344,7 @@ class ReducedKDEBirthDeathAcceleration(SamplingModifier):
             refs = target.reference_samples
             if refs.ndim >= 3:
                 self.feature_reducer.to(device=refs.device)
-                self.feature_reducer.fit_pca(refs)
+                self.feature_reducer.fit_pca(refs, timesteps=0)
 
     def _target_coordinates(
         self, samples: torch.Tensor, context: SamplingContext, scheduler
@@ -356,16 +402,22 @@ class ReducedKDEBirthDeathAcceleration(SamplingModifier):
         timestep = context.state_timestep
         target_samples = self._target_coordinates(samples, context, scheduler)
 
-        # 1. Project particle samples into reduced semantic feature space (e.g. 25D)
-        self.feature_reducer.to(device=samples.device, dtype=samples.dtype)
-        particle_features = self.feature_reducer(target_samples)  # (N, reduced_dim)
+        # Sync weights if model is a SimpleUNet
+        if hasattr(model, "down_block1") and hasattr(model, "middle2"):
+            self.feature_reducer.trunk.load_from_unet(model)
 
-        # 2. Compute particle population KDE in reduced space
+        # 1. Project particles using DDPM U-Net encoder/bottleneck features (< 1024 dims)
+        self.feature_reducer.to(device=samples.device, dtype=samples.dtype)
+        particle_features = self.feature_reducer(
+            target_samples, timesteps=timestep
+        )  # (N, reduced_dim)
+
+        # 2. Compute particle population KDE in reduced U-Net latent space
         pop_dist_sq = torch.cdist(particle_features, particle_features).square()
         log_kernel_pop = -0.5 * pop_dist_sq / (self.kernel_bandwidth**2)
         log_kde = torch.logsumexp(log_kernel_pop, dim=1) - math.log(population)
 
-        # 3. Compute target density in reduced space
+        # 3. Compute target density in reduced U-Net latent space
         if (
             hasattr(self.target, "reference_samples")
             and self.target.reference_samples is not None
@@ -379,13 +431,13 @@ class ReducedKDEBirthDeathAcceleration(SamplingModifier):
                 )
                 ref_noise = torch.randn_like(refs, generator=generator)
                 noisy_refs = refs + sigma * ref_noise
-                ref_features = self.feature_reducer(noisy_refs)
+                ref_features = self.feature_reducer(noisy_refs, timesteps=timestep)
             else:
                 if (
                     self.cached_ref_features is None
                     or self.cached_ref_features.device != samples.device
                 ):
-                    self.cached_ref_features = self.feature_reducer(refs)
+                    self.cached_ref_features = self.feature_reducer(refs, timesteps=0)
                 ref_features = self.cached_ref_features
 
             ref_dist_sq = torch.cdist(particle_features, ref_features).square()
@@ -430,11 +482,11 @@ class ReducedKDEBirthDeathAcceleration(SamplingModifier):
             if partner >= index:
                 partner += 1
             if is_overrepresented:
-                # Over-represented particle in feature space is killed; partner duplicated
+                # Over-represented particle in latent space is killed; partner duplicated
                 source_indices[index] = source_indices[partner]
                 deaths += 1
             else:
-                # Under-represented particle in feature space is duplicated; partner killed
+                # Under-represented particle in latent space is duplicated; partner killed
                 source_indices[partner] = source_indices[index]
                 births += 1
 
@@ -450,6 +502,7 @@ class ReducedKDEBirthDeathAcceleration(SamplingModifier):
                 "birth_death_population": population,
                 "reduced_kde_dim": self.reduced_dim,
                 "reduced_kde_bandwidth": self.kernel_bandwidth,
+                "reduced_kde_feature_type": "ddpm_unet_encoder",
             }
         )
         return SamplingState(
