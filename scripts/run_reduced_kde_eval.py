@@ -290,6 +290,19 @@ def main():
         help="evaluate Direct Pixel-PCA (zero convolutions, directly projects pixel space to --kde_reduce dimensions via SVD)",
     )
     parser.add_argument(
+        "--pca-only",
+        "--only-pca",
+        action="store_true",
+        help="only evaluate baseline DDIM and Pixel-PCA Birth-Death (skips standard Pixel-KDE and U-Net-KDE)",
+    )
+    parser.add_argument(
+        "--steps",
+        nargs="+",
+        type=int,
+        default=None,
+        help="list of diffusion inference step counts to evaluate (e.g. --steps 5 10 20 25 30 40 50)",
+    )
+    parser.add_argument(
         "--include-steps-10",
         action="store_true",
         help="include 10-step comparison cases in the benchmark sweep",
@@ -368,9 +381,12 @@ def main():
     # C) Direct Pixel-PCA (zero convolutions, SVD on raw pixels, dim 25) [if --pca]
     # D) Reduced-KDE (dim 25 via DDPM U-Net Bottleneck)
     cases = []
-    step_list = [25, 50]
-    if args.include_steps_10:
-        step_list.insert(0, 10)
+    if args.steps is not None:
+        step_list = [int(s) for s in args.steps]
+    else:
+        step_list = [25, 50]
+        if args.include_steps_10:
+            step_list.insert(0, 10)
 
     for st in step_list:
         cases.append({
@@ -382,16 +398,17 @@ def main():
             "tau": 0.0,
             "eta": 1.0,
         })
-        cases.append({
-            "name": f"ddim_{st}_bd_pixel_highdim",
-            "sampler": "ddim",
-            "steps": st,
-            "mode": "pixel_kde",
-            "k": 2,
-            "tau": 0.01,
-            "eta": 1.0,
-        })
-        if args.pca:
+        if not args.pca_only:
+            cases.append({
+                "name": f"ddim_{st}_bd_pixel_highdim",
+                "sampler": "ddim",
+                "steps": st,
+                "mode": "pixel_kde",
+                "k": 2,
+                "tau": 0.01,
+                "eta": 1.0,
+            })
+        if args.pca or args.pca_only:
             cases.append({
                 "name": f"ddim_{st}_bd_pixel_pca_dim{args.kde_reduce}",
                 "sampler": "ddim",
@@ -401,15 +418,16 @@ def main():
                 "tau": 0.01,
                 "eta": 1.0,
             })
-        cases.append({
-            "name": f"ddim_{st}_bd_reduced_kde_dim{args.kde_reduce}",
-            "sampler": "ddim",
-            "steps": st,
-            "mode": "reduced_kde",
-            "k": 2,
-            "tau": 0.01,
-            "eta": 1.0,
-        })
+        if not args.pca_only:
+            cases.append({
+                "name": f"ddim_{st}_bd_reduced_kde_dim{args.kde_reduce}",
+                "sampler": "ddim",
+                "steps": st,
+                "mode": "reduced_kde",
+                "k": 2,
+                "tau": 0.01,
+                "eta": 1.0,
+            })
 
     if args.compare_all_paradigms:
         cases.extend([
@@ -508,11 +526,16 @@ def main():
 
         # Plot 1: FID Comparison across Steps
         plt.figure(figsize=(7.5, 4.8), dpi=150)
-        for mode, label, color, style in [
+        curve_configs = [
             ("none", "Baseline DDIM (No BD)", "#1f77b4", "o-"),
-            ("pixel_kde", "High-Dim Pixel-KDE BD", "#d62728", "s--"),
-            ("reduced_kde", f"Reduced-KDE BD (dim={args.kde_reduce})", "#2ca02c", "^-"),
-        ]:
+            ("pixel_pca", f"Pixel-PCA BD (dim={args.kde_reduce})", "#9467bd", "D-"),
+        ]
+        if not getattr(args, "pca_only", False):
+            curve_configs.extend([
+                ("pixel_kde", "High-Dim Pixel-KDE BD", "#d62728", "s--"),
+                ("reduced_kde", f"Reduced-KDE BD (dim={args.kde_reduce})", "#2ca02c", "^-"),
+            ])
+        for mode, label, color, style in curve_configs:
             pts = [r for r in results if r["bd_mode"] == mode and r.get("fid") is not None]
             if pts:
                 pts_sorted = sorted(pts, key=lambda x: x["steps"])
@@ -529,7 +552,7 @@ def main():
         plt.xlabel("Inference Steps", fontsize=11)
         plt.ylabel("FID Score (Lower is Better)", fontsize=11)
         plt.title(
-            f"Sample Quality: Baseline vs. Pixel-KDE vs. Reduced-KDE ({args.dataset.upper()})",
+            f"Sample Quality across Steps ({args.dataset.upper()})",
             fontsize=12,
             fontweight="bold",
         )
@@ -541,21 +564,30 @@ def main():
 
         # Plot 2: Unique Particle Fraction (Diversity)
         plt.figure(figsize=(7.5, 4.5), dpi=150)
-        modes = ["Baseline", "Pixel-KDE", f"Reduced-KDE (d={args.kde_reduce})"]
+        if getattr(args, "pca_only", False):
+            modes = ["Baseline", f"Pixel-PCA (d={args.kde_reduce})"]
+            mode_keys = ("none", "pixel_pca")
+            colors = ["#1f77b4", "#9467bd"]
+        else:
+            modes = ["Baseline", "Pixel-KDE", f"Pixel-PCA (d={args.kde_reduce})", f"Reduced-KDE (d={args.kde_reduce})"]
+            mode_keys = ("none", "pixel_kde", "pixel_pca", "reduced_kde")
+            colors = ["#1f77b4", "#d62728", "#9467bd", "#2ca02c"]
+
+        step_for_div = 25 if 25 in step_list else step_list[-1]
         uniques = []
-        for mode in ("none", "pixel_kde", "reduced_kde"):
+        for mode in mode_keys:
             matching = [
                 r["unique_fraction"]
                 for r in results
-                if r["bd_mode"] == mode and r["steps"] == 25
+                if r["bd_mode"] == mode and r["steps"] == step_for_div
             ]
             uniques.append(matching[0] if matching else 1.0)
 
-        plt.bar(modes, uniques, color=["#1f77b4", "#d62728", "#2ca02c"], width=0.45)
+        plt.bar(modes, uniques, color=colors[:len(modes)], width=0.45)
         plt.axhline(1.0, linestyle=":", color="gray", label="Ideal Diversity (1.0)")
         plt.ylabel("Unique Particle Fraction", fontsize=11)
         plt.title(
-            "Population Diversity (Unique Fraction at 25 Steps)",
+            f"Population Diversity (Unique Fraction at {step_for_div} Steps)",
             fontsize=12,
             fontweight="bold",
         )
