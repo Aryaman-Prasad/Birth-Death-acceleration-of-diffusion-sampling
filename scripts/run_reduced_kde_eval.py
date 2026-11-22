@@ -34,7 +34,7 @@ from diffusion.acceleration import (
     SMCTransitionLikelihoodAcceleration,
 )
 from diffusion.datasets import make_data_module
-from diffusion.metrics import FIDEvaluator, measure_sampling
+from diffusion.metrics import FIDEvaluator, measure_sampling, rbf_mmd_squared
 from diffusion.models import make_model
 from diffusion.pipeline import SamplingPipeline
 from diffusion.samplers import make_sampler
@@ -135,7 +135,30 @@ def run_experiment_case(
     )
     unique_ratio = _unique_fraction(preview_samples)
 
-    # 2. FID evaluation
+    # 2. Quality Evaluation: MMD and NLL against reference target
+    mmd_score = None
+    nll_score = None
+    if target is not None and hasattr(target, "references") and target.references is not None:
+        try:
+            # Multi-scale RBF MMD^2 against empirical reference subset
+            ref_subset = target.references[: min(512, target.references.shape[0])].to(
+                device=device, dtype=torch.float32
+            )
+            mmd_metrics, _ = rbf_mmd_squared(
+                preview_samples.to(device=device, dtype=torch.float32), ref_subset
+            )
+            mmd_score = float(mmd_metrics["empirical_target_mmd2_rbf_multiscale"])
+        except Exception:
+            mmd_score = None
+
+        try:
+            # Empirical negative log-likelihood at t=0
+            log_prob = target.log_prob(preview_samples.to(device), 0, scheduler)
+            nll_score = float((-log_prob.mean()).item())
+        except Exception:
+            nll_score = None
+
+    # 3. FID evaluation
     fid_score = None
     if real_images is not None and fid_samples > 0:
         fid_evaluator = FIDEvaluator(device)
@@ -169,6 +192,8 @@ def run_experiment_case(
         "seconds_per_sample": round(sampling_metrics.seconds_per_sample, 4),
         "samples_per_second": round(sampling_metrics.samples_per_second, 2),
         "unique_fraction": round(unique_ratio, 4),
+        "mmd": round(mmd_score, 6) if mmd_score is not None else None,
+        "nll": round(nll_score, 2) if nll_score is not None else None,
         "fid": round(fid_score, 3) if fid_score is not None else None,
     }
     return record, preview_samples
@@ -449,7 +474,7 @@ def main():
         save_image(grid_norm, samples_dir / f"{c_name}.png", nrow=4)
         print(
             f"   -> NFE: {rec['nfe']} | Time: {rec['elapsed_seconds']}s | "
-            f"Unique: {rec['unique_fraction']} | FID: {rec['fid']}"
+            f"Unique: {rec['unique_fraction']} | MMD: {rec.get('mmd')} | NLL: {rec.get('nll')} | FID: {rec['fid']}"
         )
 
     # Save CSV
