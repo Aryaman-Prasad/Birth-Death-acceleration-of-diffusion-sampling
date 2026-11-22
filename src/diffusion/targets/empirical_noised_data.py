@@ -40,6 +40,10 @@ class EmpiricalNoisedDataTarget(nn.Module, TargetDistribution):
         self.reference_chunk_size = int(reference_chunk_size)
         self.register_buffer("reference_samples", reference_samples.detach().clone())
 
+    @property
+    def references(self) -> torch.Tensor:
+        return self.reference_samples
+
     @classmethod
     def from_dataset(cls, dataset: Dataset, num_reference_samples: int,
                      seed: int = 0, reference_chunk_size: int = 256):

@@ -138,24 +138,25 @@ def run_experiment_case(
     # 2. Quality Evaluation: MMD and NLL against reference target
     mmd_score = None
     nll_score = None
-    if target is not None and hasattr(target, "references") and target.references is not None:
+    ref_tensor = getattr(target, "reference_samples", getattr(target, "references", None))
+    if target is not None and ref_tensor is not None:
         try:
             # Multi-scale RBF MMD^2 against empirical reference subset
-            ref_subset = target.references[: min(512, target.references.shape[0])].to(
+            ref_subset = ref_tensor[: min(512, ref_tensor.shape[0])].to(
                 device=device, dtype=torch.float32
             )
             mmd_metrics, _ = rbf_mmd_squared(
                 preview_samples.to(device=device, dtype=torch.float32), ref_subset
             )
             mmd_score = float(mmd_metrics["empirical_target_mmd2_rbf_multiscale"])
-        except Exception:
+        except Exception as e:
             mmd_score = None
 
         try:
             # Empirical negative log-likelihood at t=0
             log_prob = target.log_prob(preview_samples.to(device), 0, scheduler)
             nll_score = float((-log_prob.mean()).item())
-        except Exception:
+        except Exception as e:
             nll_score = None
 
     # 3. FID evaluation
