@@ -198,7 +198,12 @@ def main():
         "--fid-samples",
         type=int,
         default=256,
-        help="Number of real & generated images for FID evaluation",
+        help="Number of real & generated images for FID evaluation (set to 0 to disable FID)",
+    )
+    parser.add_argument(
+        "--no-fid",
+        action="store_true",
+        help="disable FID evaluation entirely (runs fast throughput benchmark only)",
     )
     parser.add_argument("--fid-batch-size", type=int, default=32)
     parser.add_argument(
@@ -261,6 +266,8 @@ def main():
         help="include DDPM (1000-step ancestral) baseline in the benchmark sweep",
     )
     args = parser.parse_args()
+    if getattr(args, "no_fid", False):
+        args.fid_samples = 0
 
     device = torch.device(
         "cuda"
