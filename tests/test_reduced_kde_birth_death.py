@@ -143,3 +143,29 @@ def test_cli_kde_reduce_arguments():
     # Test --kde-reduce alias
     args = parse_args(["--toy-mixture-oracle", "--kde-reduce", "16"])
     assert args.kde_reduce == 16
+
+    # Test --pca flag
+    args_pca = parse_args(["--toy-mixture-oracle", "--pca", "--kde_reduce", "25"])
+    assert args_pca.pca is True
+    assert args_pca.cnn_backbone == "pca"
+    assert args_pca.projection_method == "pca"
+
+
+def test_direct_pixel_pca_reducer():
+    """Verify that backbone='pca' uses zero convolutions and directly projects pixels to 25 dims."""
+    reducer = FeatureReducer(reduced_dim=25, backbone="pca", projection_method="pca")
+    assert reducer.is_pixel_pca is True
+    assert reducer.trunk is None, "Direct Pixel-PCA should have no convolutional trunk"
+
+    # Pre-fit on 32 references
+    refs = torch.randn(32, 3, 32, 32)
+    reducer.fit_pca(refs)
+    assert reducer.is_pca_fitted is True
+    assert reducer.pca_proj.shape == (3072, 25), f"Expected (3072, 25), got {reducer.pca_proj.shape}"
+
+    # Project a batch of 8 images
+    x = torch.randn(8, 3, 32, 32)
+    out = reducer(x)
+    assert out.shape == (8, 25), f"Expected (8, 25), got {out.shape}"
+    assert torch.isfinite(out).all()
+

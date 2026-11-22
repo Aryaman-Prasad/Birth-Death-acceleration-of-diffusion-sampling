@@ -89,7 +89,8 @@ def run_experiment_case(
                 total_time=bd_total_time,
             )
         )
-    elif bd_mode == "reduced_kde" and target is not None:
+    elif bd_mode in ("reduced_kde", "pixel_pca") and target is not None:
+        effective_backbone = "pca" if bd_mode == "pixel_pca" else cnn_backbone
         modifiers.append(
             ReducedKDEBirthDeathAcceleration(
                 target,
@@ -97,7 +98,7 @@ def run_experiment_case(
                 kde_reduce=kde_reduce,
                 every_k_steps=bd_every_k,
                 total_time=bd_total_time,
-                backbone=cnn_backbone,
+                backbone=effective_backbone,
                 projection_method=projection_method,
                 noise_references=noise_references,
                 seed=seed,
@@ -159,7 +160,7 @@ def run_experiment_case(
         "steps": steps,
         "eta": eta,
         "bd_mode": bd_mode,
-        "kde_reduce": kde_reduce if bd_mode == "reduced_kde" else None,
+        "kde_reduce": kde_reduce if bd_mode in ("reduced_kde", "pixel_pca") else None,
         "bd_every_k": bd_every_k if bd_mode != "none" else None,
         "bd_total_time": bd_total_time if bd_mode != "none" else None,
         "bd_bandwidth": bd_bandwidth if bd_mode != "none" else None,
@@ -242,6 +243,12 @@ def main():
         "--compare-all-paradigms",
         action="store_true",
         help="also benchmark SMC reverse transition likelihood and particle filtering exploration",
+    )
+    parser.add_argument(
+        "--pca",
+        "--pixel-pca",
+        action="store_true",
+        help="evaluate Direct Pixel-PCA (zero convolutions, directly projects pixel space to --kde_reduce dimensions via SVD)",
     )
     parser.add_argument(
         "--include-steps-10",
@@ -372,6 +379,34 @@ def main():
             "eta": 1.0,
         },
     ]
+
+    if args.pca:
+        cases.insert(3, {
+            "name": f"ddim_25_bd_pixel_pca_dim{args.kde_reduce}",
+            "steps": 25,
+            "mode": "pixel_pca",
+            "k": 2,
+            "tau": 0.01,
+            "eta": 1.0,
+        })
+        cases.append({
+            "name": f"ddim_50_bd_pixel_pca_dim{args.kde_reduce}",
+            "steps": 50,
+            "mode": "pixel_pca",
+            "k": 2,
+            "tau": 0.01,
+            "eta": 1.0,
+        })
+        if args.include_steps_10:
+            cases.append({
+                "name": f"ddim_10_bd_pixel_pca_dim{args.kde_reduce}",
+                "sampler": "ddim",
+                "steps": 10,
+                "mode": "pixel_pca",
+                "k": 2,
+                "tau": 0.01,
+                "eta": 1.0,
+            })
 
     if args.compare_all_paradigms:
         cases.extend([

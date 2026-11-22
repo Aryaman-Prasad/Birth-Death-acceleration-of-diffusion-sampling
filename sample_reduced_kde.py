@@ -185,12 +185,18 @@ def parse_args(argv=None):
         help="target compressed feature dimension for KDE (default: 25, much smaller than 3072)",
     )
     parser.add_argument(
+        "--pca",
+        "--pixel-pca",
+        action="store_true",
+        help="use Direct Pixel-PCA (zero convolutions; directly projects flattened pixel space to --kde_reduce dimensions via SVD)",
+    )
+    parser.add_argument(
         "--unet-layer",
         "--unet-backbone",
         "--cnn-backbone",
         dest="cnn_backbone",
         default="bottleneck",
-        help="DDPM U-Net encoder/bottleneck layer (< 1024 dims) for feature extraction: bottleneck (128D), down_block2 (128D), down_block1 (64D), auto (default: bottleneck)",
+        help="DDPM U-Net layer (bottleneck, down_block2, down_block1) or 'pca' for Direct Pixel-PCA without convolutions (default: bottleneck)",
     )
     parser.add_argument(
         "--projection-method",
@@ -251,7 +257,11 @@ def parse_args(argv=None):
     parser.add_argument("--fid-batch-size", type=int, default=64)
     parser.add_argument("--device", default="auto")
 
-    return parser.parse_args(argv)
+    parsed = parser.parse_args(argv)
+    if getattr(parsed, "pca", False):
+        parsed.cnn_backbone = "pca"
+        parsed.projection_method = "pca"
+    return parsed
 
 
 def main(argv=None):

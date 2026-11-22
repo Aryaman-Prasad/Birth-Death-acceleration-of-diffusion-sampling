@@ -160,38 +160,48 @@ class FeatureReducer(nn.Module):
         self.projection_method = projection_method
         self.seed = seed
 
-        # Map layer choice
-        layer = "bottleneck"
-        if backbone in ("down_block1", "down_block2", "bottleneck"):
-            layer = backbone
-        elif backbone in ("convnet", "resnet18", "vgg16", "mobilenet", "mobilenet_v3", "auto"):
-            # Cleanly replace external CNN classification backbones with U-Net bottleneck
-            layer = "bottleneck"
-
-        # Native DDPM U-Net encoder trunk (< 1024 dimensions)
-        self.trunk = DDPMUNetEncoderTrunk(
-            image_channels=3,
-            base_channels=64,
-            time_channels=256,
-            layer=layer,
-            checkpoint_path=checkpoint_path,
+        # Check if backbone is direct pixel-PCA (zero convolutions, projects raw pixels directly)
+        self.is_pixel_pca = str(backbone).lower() in (
+            "pca", "pixel_pca", "pixel-pca", "pixel", "none", "linear_pca", "linear-pca"
         )
-        self.raw_dim = self.trunk.out_dim  # 128 dimensions (< 1024)
-        self.trunk.eval()
-        for param in self.trunk.parameters():
-            param.requires_grad = False
 
-        # Initialize fixed orthogonal projection as fallback
-        self._init_orthogonal(self.raw_dim, self.reduced_dim, seed=seed)
+        if self.is_pixel_pca:
+            self.trunk = None
+            self.raw_dim = None
+        else:
+            # Map layer choice
+            layer = "bottleneck"
+            if backbone in ("down_block1", "down_block2", "bottleneck"):
+                layer = backbone
+            elif backbone in ("convnet", "resnet18", "vgg16", "mobilenet", "mobilenet_v3", "auto"):
+                # Cleanly replace external CNN classification backbones with U-Net bottleneck
+                layer = "bottleneck"
+
+            # Native DDPM U-Net encoder trunk (< 1024 dimensions)
+            self.trunk = DDPMUNetEncoderTrunk(
+                image_channels=3,
+                base_channels=64,
+                time_channels=256,
+                layer=layer,
+                checkpoint_path=checkpoint_path,
+            )
+            self.raw_dim = self.trunk.out_dim  # 128 dimensions (< 1024)
+            self.trunk.eval()
+            for param in self.trunk.parameters():
+                param.requires_grad = False
+
+            # Initialize fixed orthogonal projection as fallback
+            self._init_orthogonal(self.raw_dim, self.reduced_dim, seed=seed)
+
         self.is_pca_fitted = False
 
         # Neural Network projection heads (Linear or MLP)
-        if self.projection_method == "linear":
+        if self.projection_method == "linear" and not self.is_pixel_pca:
             torch.manual_seed(seed)
             self.nn_head = nn.Linear(self.raw_dim, self.reduced_dim)
             for p in self.nn_head.parameters():
                 p.requires_grad = False
-        elif self.projection_method == "mlp":
+        elif self.projection_method == "mlp" and not self.is_pixel_pca:
             torch.manual_seed(seed)
             hidden_dim = max(self.reduced_dim * 2, 64)
             self.nn_head = nn.Sequential(
@@ -220,6 +230,10 @@ class FeatureReducer(nn.Module):
         self.to(device=reference_samples.device)
         with torch.no_grad():
             ref_raw = self._extract_raw(reference_samples, timesteps=timesteps)  # (M, raw_dim)
+            if self.raw_dim is None:
+                self.raw_dim = ref_raw.shape[1]
+                self._init_orthogonal(self.raw_dim, self.reduced_dim, seed=self.seed)
+
             mean = ref_raw.mean(dim=0, keepdim=True)
             centered = ref_raw - mean
             # SVD on centered features
@@ -235,9 +249,13 @@ class FeatureReducer(nn.Module):
     def _extract_raw(
         self, x: torch.Tensor, timesteps: Any = None, chunk_size: int = 64
     ) -> torch.Tensor:
-        """Extract DDPM U-Net encoder/bottleneck features (< 1024 dims)."""
+        """Extract raw features (flattened pixels for PCA, or DDPM U-Net encoder/bottleneck features)."""
         if x.ndim == 2:
             return x
+
+        if self.is_pixel_pca:
+            # Flatten spatial image directly (N, C*H*W) with zero convolutions
+            return x.flatten(start_dim=1)
 
         self.trunk.to(device=x.device, dtype=x.dtype)
 
@@ -283,12 +301,13 @@ class FeatureReducer(nn.Module):
             reduced = (centered @ proj) / stds
             return reduced
 
-        # Fallback to orthogonal projection
-        ortho = self.ortho_proj.to(device=raw.device, dtype=raw.dtype)
-        if raw.shape[1] != ortho.shape[0]:
-            k = min(raw.shape[1], self.reduced_dim)
-            return raw[:, :k]
-        return raw @ ortho
+        # Fallback to orthogonal projection if available
+        if hasattr(self, "ortho_proj"):
+            ortho = self.ortho_proj.to(device=raw.device, dtype=raw.dtype)
+            if raw.shape[1] == ortho.shape[0]:
+                return raw @ ortho
+        k = min(raw.shape[1], self.reduced_dim)
+        return raw[:, :k]
 
 
 class ReducedKDEBirthDeathAcceleration(SamplingModifier):
