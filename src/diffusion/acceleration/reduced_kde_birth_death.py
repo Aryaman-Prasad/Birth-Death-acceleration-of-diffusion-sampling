@@ -448,7 +448,12 @@ class ReducedKDEBirthDeathAcceleration(SamplingModifier):
                 sigma = self.target.noise_std(
                     int(timestep), scheduler, device=samples.device, dtype=samples.dtype
                 )
-                ref_noise = torch.randn_like(refs, generator=generator)
+                ref_noise = torch.randn(
+                    refs.shape,
+                    device=refs.device,
+                    dtype=refs.dtype,
+                    generator=generator,
+                )
                 noisy_refs = refs + sigma * ref_noise
                 ref_features = self.feature_reducer(noisy_refs, timesteps=timestep)
             else:
