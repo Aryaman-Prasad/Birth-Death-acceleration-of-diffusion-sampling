@@ -25,9 +25,13 @@ from torchvision.utils import save_image
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
 sys.path.insert(0, str(PROJECT_ROOT / "src"))
 
-from diffusion.acceleration.birth_death import BirthDeathAcceleration
-from diffusion.acceleration.reduced_kde_birth_death import (
+from diffusion.acceleration import (
+    BirthDeathAcceleration,
+    ContinuousNormalizingFlowTarget,
+    FlowBirthDeathAcceleration,
+    ParticleFilteringSolutionSpaceExplorer,
     ReducedKDEBirthDeathAcceleration,
+    SMCTransitionLikelihoodAcceleration,
 )
 from diffusion.datasets import make_data_module
 from diffusion.metrics import FIDEvaluator, measure_sampling
@@ -97,6 +101,22 @@ def run_experiment_case(
                 projection_method=projection_method,
                 noise_references=noise_references,
                 seed=seed,
+            )
+        )
+    elif bd_mode == "smc_transition":
+        modifiers.append(
+            SMCTransitionLikelihoodAcceleration(
+                every_k_steps=bd_every_k,
+                total_time=bd_total_time,
+                temperature=1.0,
+            )
+        )
+    elif bd_mode == "particle_filter":
+        modifiers.append(
+            ParticleFilteringSolutionSpaceExplorer(
+                branch_factor=2,
+                every_k_steps=bd_every_k,
+                temperature=1.0,
             )
         )
 
@@ -218,6 +238,21 @@ def main():
         default=True,
         help="whether to re-noise references at each step (pass --no-noise-references for 10x faster caching)",
     )
+    parser.add_argument(
+        "--compare-all-paradigms",
+        action="store_true",
+        help="also benchmark SMC reverse transition likelihood and particle filtering exploration",
+    )
+    parser.add_argument(
+        "--include-steps-10",
+        action="store_true",
+        help="include 10-step comparison cases in the benchmark sweep",
+    )
+    parser.add_argument(
+        "--include-ddpm",
+        action="store_true",
+        help="include DDPM (1000-step ancestral) baseline in the benchmark sweep",
+    )
     args = parser.parse_args()
 
     device = torch.device(
@@ -338,6 +373,68 @@ def main():
         },
     ]
 
+    if args.compare_all_paradigms:
+        cases.extend([
+            {
+                "name": "ddim_25_smc_transition",
+                "steps": 25,
+                "mode": "smc_transition",
+                "k": 2,
+                "tau": 0.01,
+                "eta": 1.0,
+            },
+            {
+                "name": "ddim_25_particle_filter",
+                "steps": 25,
+                "mode": "particle_filter",
+                "k": 2,
+                "tau": 0.01,
+                "eta": 1.0,
+            },
+        ])
+
+    if args.include_steps_10:
+        cases.extend([
+            {
+                "name": "ddim_10_baseline",
+                "sampler": "ddim",
+                "steps": 10,
+                "mode": "none",
+                "k": 1,
+                "tau": 0.0,
+                "eta": 1.0,
+            },
+            {
+                "name": "ddim_10_bd_pixel_highdim",
+                "sampler": "ddim",
+                "steps": 10,
+                "mode": "pixel_kde",
+                "k": 2,
+                "tau": 0.01,
+                "eta": 1.0,
+            },
+            {
+                "name": f"ddim_10_bd_reduced_kde_dim{args.kde_reduce}",
+                "sampler": "ddim",
+                "steps": 10,
+                "mode": "reduced_kde",
+                "k": 2,
+                "tau": 0.01,
+                "eta": 1.0,
+            },
+        ])
+
+    if args.include_ddpm:
+        cases.append({
+            "name": "ddpm_1000_baseline",
+            "sampler": "ddpm",
+            "steps": 1000,
+            "mode": "none",
+            "k": 1,
+            "tau": 0.0,
+            "eta": 1.0,
+        })
+
     results = []
     print("\n" + "=" * 80)
     print(f"RUNNING REDUCED-KDE BENCHMARK SWEEP (--kde_reduce={args.kde_reduce})")
@@ -345,11 +442,12 @@ def main():
 
     for case in cases:
         c_name = case["name"]
-        print(f"\n[Case: {c_name}] Running {case['mode']} at {case['steps']} steps...")
+        sampler_name = case.get("sampler", "ddim")
+        print(f"\n[Case: {c_name}] Running {sampler_name} ({case['mode']}) at {case['steps']} steps...")
         rec, preview = run_experiment_case(
             model=model,
             scheduler=scheduler,
-            sampler_name="ddim",
+            sampler_name=sampler_name,
             steps=case["steps"],
             eta=case["eta"],
             sample_shape=sample_shape,

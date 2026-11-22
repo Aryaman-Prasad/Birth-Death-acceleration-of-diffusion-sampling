@@ -22,8 +22,12 @@ import torch
 from torchvision.utils import save_image
 from torch.utils.data import DataLoader
 
-from diffusion.acceleration.reduced_kde_birth_death import (
+from diffusion.acceleration import (
+    ContinuousNormalizingFlowTarget,
+    FlowBirthDeathAcceleration,
+    ParticleFilteringSolutionSpaceExplorer,
     ReducedKDEBirthDeathAcceleration,
+    SMCTransitionLikelihoodAcceleration,
 )
 from diffusion.datasets import make_data_module
 from diffusion.engine import load_checkpoint
@@ -201,6 +205,26 @@ def parse_args(argv=None):
         help="whether to noise reference images at timestep t to match marginal noise level",
     )
 
+    # 3 Novel Acceleration Paradigms: SMC Transition Likelihood, Exact Flow, Particle Filtering
+    parser.add_argument(
+        "--acceleration-method",
+        choices=("reduced_kde", "smc_transition", "particle_filter", "flow_exact"),
+        default="reduced_kde",
+        help="acceleration method: reduced_kde (default), smc_transition (SMC reverse transition density), particle_filter (solution space branching & filtering), or flow_exact (CNF)",
+    )
+    parser.add_argument(
+        "--smc-temp",
+        type=float,
+        default=1.0,
+        help="temperature scaling for SMC reverse transition log-likelihood weights",
+    )
+    parser.add_argument(
+        "--filter-branch-factor",
+        type=int,
+        default=2,
+        help="branching factor B for particle filtering solution space exploration (default: 2)",
+    )
+
     # General sampling options
     parser.add_argument("--toy-mixture-radius", type=float, default=2.0)
     parser.add_argument(
@@ -310,23 +334,51 @@ def main(argv=None):
 
     modifiers = []
     if args.birth_death:
-        if target is None:
-            raise ValueError(
-                "--birth-death requires a known target (e.g. --empirical-data-target or --toy-mixture-oracle)"
+        if args.acceleration_method == "smc_transition":
+            modifiers.append(
+                SMCTransitionLikelihoodAcceleration(
+                    every_k_steps=args.bd_every_k,
+                    total_time=args.bd_total_time,
+                    temperature=args.smc_temp,
+                )
             )
-        modifiers.append(
-            ReducedKDEBirthDeathAcceleration(
-                target,
-                args.bd_kernel_bandwidth,
-                kde_reduce=args.kde_reduce,
-                every_k_steps=args.bd_every_k,
-                total_time=args.bd_total_time,
-                backbone=args.cnn_backbone,
-                projection_method=args.projection_method,
-                noise_references=args.noise_references,
-                seed=args.seed or 42,
+        elif args.acceleration_method == "particle_filter":
+            modifiers.append(
+                ParticleFilteringSolutionSpaceExplorer(
+                    branch_factor=args.filter_branch_factor,
+                    every_k_steps=args.bd_every_k,
+                    temperature=args.smc_temp,
+                )
             )
-        )
+        elif args.acceleration_method == "flow_exact":
+            if target is None:
+                raise ValueError("--flow_exact requires a target with exact log_prob")
+            modifiers.append(
+                FlowBirthDeathAcceleration(
+                    flow_target=target,
+                    every_k_steps=args.bd_every_k,
+                    total_time=args.bd_total_time,
+                    bandwidth=args.bd_kernel_bandwidth,
+                )
+            )
+        else:
+            if target is None:
+                raise ValueError(
+                    "--birth-death requires a known target (e.g. --empirical-data-target or --toy-mixture-oracle)"
+                )
+            modifiers.append(
+                ReducedKDEBirthDeathAcceleration(
+                    target,
+                    args.bd_kernel_bandwidth,
+                    kde_reduce=args.kde_reduce,
+                    every_k_steps=args.bd_every_k,
+                    total_time=args.bd_total_time,
+                    backbone=args.cnn_backbone,
+                    projection_method=args.projection_method,
+                    noise_references=args.noise_references,
+                    seed=args.seed or 42,
+                )
+            )
 
     pipeline = SamplingPipeline(sampler, scheduler, modifiers=modifiers)
 
@@ -388,6 +440,7 @@ def main(argv=None):
             "unet_layer": args.cnn_backbone,
             "projection_method": args.projection_method,
             "birth_death": args.birth_death,
+            "acceleration_method": args.acceleration_method,
         }
         out_metrics = Path(args.metrics_output)
         out_metrics.parent.mkdir(parents=True, exist_ok=True)
