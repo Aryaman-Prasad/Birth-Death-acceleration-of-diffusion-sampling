@@ -328,97 +328,60 @@ def main():
                 break
         real_images = torch.cat(img_list, dim=0)
 
-    # 4. Three-way comparison cases:
+    # 4. Multi-way comparison cases:
     # A) Baseline DDIM
     # B) Standard High-Dim Pixel-KDE (dim 3072/196608)
-    # C) Reduced-KDE (dim 25 via Pretrained CNN)
-    cases = [
-        # Baseline
-        {
-            "name": "ddim_25_baseline",
-            "steps": 25,
-            "mode": "none",
-            "k": 1,
-            "tau": 0.0,
-            "eta": 1.0,
-        },
-        # High-Dim Pixel KDE BD (old)
-        {
-            "name": "ddim_25_bd_pixel_highdim",
-            "steps": 25,
-            "mode": "pixel_kde",
-            "k": 2,
-            "tau": 0.01,
-            "eta": 1.0,
-        },
-        # Reduced-KDE BD (new dim=25)
-        {
-            "name": f"ddim_25_bd_reduced_kde_dim{args.kde_reduce}",
-            "steps": 25,
-            "mode": "reduced_kde",
-            "k": 2,
-            "tau": 0.01,
-            "eta": 1.0,
-        },
-        # 50-step comparison
-        {
-            "name": "ddim_50_baseline",
-            "steps": 50,
-            "mode": "none",
-            "k": 1,
-            "tau": 0.0,
-            "eta": 1.0,
-        },
-        {
-            "name": "ddim_50_bd_pixel_highdim",
-            "steps": 50,
-            "mode": "pixel_kde",
-            "k": 2,
-            "tau": 0.01,
-            "eta": 1.0,
-        },
-        {
-            "name": f"ddim_50_bd_reduced_kde_dim{args.kde_reduce}",
-            "steps": 50,
-            "mode": "reduced_kde",
-            "k": 2,
-            "tau": 0.01,
-            "eta": 1.0,
-        },
-    ]
+    # C) Direct Pixel-PCA (zero convolutions, SVD on raw pixels, dim 25) [if --pca]
+    # D) Reduced-KDE (dim 25 via DDPM U-Net Bottleneck)
+    cases = []
+    step_list = [25, 50]
+    if args.include_steps_10:
+        step_list.insert(0, 10)
 
-    if args.pca:
-        cases.insert(3, {
-            "name": f"ddim_25_bd_pixel_pca_dim{args.kde_reduce}",
-            "steps": 25,
-            "mode": "pixel_pca",
-            "k": 2,
-            "tau": 0.01,
+    for st in step_list:
+        cases.append({
+            "name": f"ddim_{st}_baseline",
+            "sampler": "ddim",
+            "steps": st,
+            "mode": "none",
+            "k": 1,
+            "tau": 0.0,
             "eta": 1.0,
         })
         cases.append({
-            "name": f"ddim_50_bd_pixel_pca_dim{args.kde_reduce}",
-            "steps": 50,
-            "mode": "pixel_pca",
+            "name": f"ddim_{st}_bd_pixel_highdim",
+            "sampler": "ddim",
+            "steps": st,
+            "mode": "pixel_kde",
             "k": 2,
             "tau": 0.01,
             "eta": 1.0,
         })
-        if args.include_steps_10:
+        if args.pca:
             cases.append({
-                "name": f"ddim_10_bd_pixel_pca_dim{args.kde_reduce}",
+                "name": f"ddim_{st}_bd_pixel_pca_dim{args.kde_reduce}",
                 "sampler": "ddim",
-                "steps": 10,
+                "steps": st,
                 "mode": "pixel_pca",
                 "k": 2,
                 "tau": 0.01,
                 "eta": 1.0,
             })
+        cases.append({
+            "name": f"ddim_{st}_bd_reduced_kde_dim{args.kde_reduce}",
+            "sampler": "ddim",
+            "steps": st,
+            "mode": "reduced_kde",
+            "k": 2,
+            "tau": 0.01,
+            "eta": 1.0,
+        })
 
     if args.compare_all_paradigms:
         cases.extend([
             {
                 "name": "ddim_25_smc_transition",
+                "sampler": "ddim",
                 "steps": 25,
                 "mode": "smc_transition",
                 "k": 2,
@@ -427,39 +390,9 @@ def main():
             },
             {
                 "name": "ddim_25_particle_filter",
+                "sampler": "ddim",
                 "steps": 25,
                 "mode": "particle_filter",
-                "k": 2,
-                "tau": 0.01,
-                "eta": 1.0,
-            },
-        ])
-
-    if args.include_steps_10:
-        cases.extend([
-            {
-                "name": "ddim_10_baseline",
-                "sampler": "ddim",
-                "steps": 10,
-                "mode": "none",
-                "k": 1,
-                "tau": 0.0,
-                "eta": 1.0,
-            },
-            {
-                "name": "ddim_10_bd_pixel_highdim",
-                "sampler": "ddim",
-                "steps": 10,
-                "mode": "pixel_kde",
-                "k": 2,
-                "tau": 0.01,
-                "eta": 1.0,
-            },
-            {
-                "name": f"ddim_10_bd_reduced_kde_dim{args.kde_reduce}",
-                "sampler": "ddim",
-                "steps": 10,
-                "mode": "reduced_kde",
                 "k": 2,
                 "tau": 0.01,
                 "eta": 1.0,
