@@ -141,21 +141,29 @@ def run_experiment_case(
     ref_tensor = getattr(target, "reference_samples", getattr(target, "references", None))
     if target is not None and ref_tensor is not None:
         try:
-            # Multi-scale RBF MMD^2 against empirical reference subset
-            ref_subset = ref_tensor[: min(512, ref_tensor.shape[0])].to(
-                device=device, dtype=torch.float32
-            )
-            mmd_metrics, _ = rbf_mmd_squared(
-                preview_samples.to(device=device, dtype=torch.float32), ref_subset
-            )
+            # Multi-scale RBF MMD^2 against empirical reference subset (up to 512 references)
+            n_refs = min(512, ref_tensor.shape[0])
+            ref_subset = ref_tensor[:n_refs].to(device=device, dtype=torch.float32)
+            eval_samples = preview_samples.to(device=device, dtype=torch.float32)
+            mmd_metrics, _ = rbf_mmd_squared(eval_samples, ref_subset)
             mmd_score = float(mmd_metrics["empirical_target_mmd2_rbf_multiscale"])
         except Exception as e:
             mmd_score = None
 
         try:
-            # Empirical negative log-likelihood at t=0
-            log_prob = target.log_prob(preview_samples.to(device), 0, scheduler)
-            nll_score = float((-log_prob.mean()).item())
+            # Empirical negative log-likelihood under target distribution
+            alpha_bar = scheduler.alpha_bars[0].to(device)
+            density_samples = preview_samples.to(device) / alpha_bar.sqrt()
+            log_prob = target.log_prob(density_samples, 0, scheduler)
+            if torch.isfinite(log_prob).any():
+                nll_score = float((-log_prob[torch.isfinite(log_prob)].mean()).item())
+            else:
+                # Fallback to smoothed marginal at t=50 to avoid high-dim float32 delta underflow
+                log_prob_s = target.log_prob(density_samples, 50, scheduler)
+                if torch.isfinite(log_prob_s).any():
+                    nll_score = float((-log_prob_s[torch.isfinite(log_prob_s)].mean()).item())
+                else:
+                    nll_score = None
         except Exception as e:
             nll_score = None
 
