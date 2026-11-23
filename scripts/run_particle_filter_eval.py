@@ -144,7 +144,12 @@ def main():
     )
     parser.add_argument("--dataset", choices=("cifar10", "imagefolder"), default="cifar10")
     parser.add_argument("--data-dir", default="data")
-    parser.add_argument("--download", action="store_true")
+    parser.add_argument(
+        "--download",
+        action=argparse.BooleanOptionalAction,
+        default=True,
+        help="Download dataset if missing (default: True)",
+    )
     parser.add_argument("--image-size", type=int, default=32)
     parser.add_argument(
         "--fid-samples",
@@ -198,8 +203,9 @@ def main():
     real_images = None
     if args.fid_samples > 0:
         print(f"[+] Loading {args.fid_samples} real {args.dataset.upper()} images for FID evaluation...")
+        download_dataset = True if args.dataset == "cifar10" else getattr(args, "download", True)
         data_module = make_data_module(
-            args.dataset, args.data_dir, args.image_size, args.download, train=True
+            args.dataset, args.data_dir, args.image_size, download_dataset, train=True
         )
         dataset = data_module.dataset()
         from torch.utils.data import DataLoader
