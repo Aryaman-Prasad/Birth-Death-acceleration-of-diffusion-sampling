@@ -120,6 +120,15 @@ def run_experiment_case(
                 temperature=1.0,
             )
         )
+    elif bd_mode in ("flow_exact", "flow_birth_death") and target is not None:
+        modifiers.append(
+            FlowBirthDeathAcceleration(
+                flow_target=target,
+                every_k_steps=bd_every_k,
+                total_time=bd_total_time,
+                bandwidth=bd_bandwidth,
+            )
+        )
 
     pipeline = SamplingPipeline(sampler, scheduler, modifiers=modifiers)
 
@@ -411,6 +420,8 @@ def main():
                 raw_methods.append("pixel_pca")
             elif m_clean in ("reduced_kde", "unet", "unet_kde"):
                 raw_methods.append("reduced_kde")
+            elif m_clean in ("flow_exact", "flow", "flow_birth_death", "cnf"):
+                raw_methods.append("flow_exact")
     elif args.compare_all_paradigms:
         raw_methods = ["none", "pixel_kde", "smc_transition", "particle_filter"]
     elif args.pca_only:
@@ -477,6 +488,16 @@ def main():
                 "sampler": "ddim",
                 "steps": st,
                 "mode": "reduced_kde",
+                "k": 2,
+                "tau": 0.01,
+                "eta": 1.0,
+            })
+        if "flow_exact" in raw_methods:
+            cases.append({
+                "name": f"ddim_{st}_flow_exact",
+                "sampler": "ddim",
+                "steps": st,
+                "mode": "flow_exact",
                 "k": 2,
                 "tau": 0.01,
                 "eta": 1.0,
@@ -562,6 +583,7 @@ def main():
             ("pixel_kde", "High-Dim Pixel-KDE BD", "#d62728", "s--"),
             ("smc_transition", "SMC Reverse Transition Weighting", "#ff7f0e", "v-"),
             ("particle_filter", "Particle Filtering Solution Explorer", "#e377c2", "p-"),
+            ("flow_exact", "Exact Flow Birth-Death (CNF)", "#8c564b", "*--"),
             ("pixel_pca", f"Pixel-PCA BD (dim={args.kde_reduce})", "#9467bd", "D-"),
             ("reduced_kde", f"Reduced-KDE BD (dim={args.kde_reduce})", "#2ca02c", "^-"),
         ]
@@ -599,6 +621,7 @@ def main():
             "pixel_kde": ("Pixel-KDE", "#d62728"),
             "smc_transition": ("SMC-Transition", "#ff7f0e"),
             "particle_filter": ("Particle-Filter", "#e377c2"),
+            "flow_exact": ("Flow-Exact", "#8c564b"),
             "pixel_pca": (f"Pixel-PCA (d={args.kde_reduce})", "#9467bd"),
             "reduced_kde": (f"Reduced-KDE (d={args.kde_reduce})", "#2ca02c"),
         }
