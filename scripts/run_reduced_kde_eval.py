@@ -42,10 +42,45 @@ from diffusion.schedulers import make_scheduler
 from diffusion.targets import EmpiricalNoisedDataTarget
 
 
-def _unique_fraction(samples: torch.Tensor) -> float:
-    flat = samples.reshape(samples.shape[0], -1)
-    unique_count = torch.unique(flat, dim=0).shape[0]
-    return float(unique_count / samples.shape[0])
+def _unique_fraction(samples: torch.Tensor, threshold: float = 0.05) -> float:
+    """Calculates the fraction of perceptually unique images in a batch.
+
+    Images are normalized to [0, 1]. Two images whose Mean Absolute Error (MAE)
+    is below `threshold` (default 0.05, i.e. 5% average pixel difference) are
+    detected as duplicate/repeating modes from the same parent particle.
+    """
+    N = samples.shape[0]
+    if N <= 1:
+        return 1.0
+
+    s = samples.detach().float()
+    s_min = (
+        s.amin(dim=(1, 2, 3), keepdim=True)
+        if s.ndim == 4
+        else s.amin(dim=1, keepdim=True)
+    )
+    s_max = (
+        s.amax(dim=(1, 2, 3), keepdim=True)
+        if s.ndim == 4
+        else s.amax(dim=1, keepdim=True)
+    )
+    denom = (s_max - s_min).clamp_min(1e-6)
+    normed = (s - s_min) / denom
+    flat = normed.reshape(N, -1)
+
+    # Pairwise Mean Absolute Error (MAE) across all pixels
+    mae_matrix = torch.cdist(flat, flat, p=1) / flat.shape[1]
+
+    unique_mask = torch.ones(N, dtype=torch.bool, device=samples.device)
+    for i in range(N):
+        if not unique_mask[i]:
+            continue
+        for j in range(i + 1, N):
+            if unique_mask[j] and mae_matrix[i, j] < threshold:
+                unique_mask[j] = False
+
+    unique_count = int(unique_mask.sum().item())
+    return float(unique_count / N)
 
 
 def run_experiment_case(
@@ -68,8 +103,11 @@ def run_experiment_case(
     bd_every_k: int = 2,
     bd_total_time: float = 0.01,
     bd_bandwidth: float = 0.3,
+    bd_min_timestep: int | None = 100,
+    bd_max_delta_tau: float = 0.005,
+    bd_max_event_probability: float = 0.25,
     real_images: torch.Tensor | None = None,
-    fid_samples: int = 256,
+    fid_samples: int = 0,
     fid_batch_size: int = 32,
 ):
     """Executes a single sampling case with latency, NFE, diversity, and FID."""
@@ -87,6 +125,9 @@ def run_experiment_case(
                 bd_bandwidth,
                 every_k_steps=bd_every_k,
                 total_time=bd_total_time,
+                min_timestep=bd_min_timestep,
+                max_delta_tau=bd_max_delta_tau,
+                max_event_probability=bd_max_event_probability,
             )
         )
     elif bd_mode in ("reduced_kde", "pixel_pca") and target is not None:
@@ -102,6 +143,9 @@ def run_experiment_case(
                 projection_method=projection_method,
                 noise_references=noise_references,
                 seed=seed,
+                min_timestep=bd_min_timestep,
+                max_delta_tau=bd_max_delta_tau,
+                max_event_probability=bd_max_event_probability,
             )
         )
     elif bd_mode == "smc_transition":
@@ -110,6 +154,9 @@ def run_experiment_case(
                 every_k_steps=bd_every_k,
                 total_time=bd_total_time,
                 temperature=1.0,
+                min_timestep=bd_min_timestep,
+                max_delta_tau=bd_max_delta_tau,
+                max_event_probability=bd_max_event_probability,
             )
         )
     elif bd_mode == "particle_filter":
@@ -118,6 +165,8 @@ def run_experiment_case(
                 branch_factor=2,
                 every_k_steps=bd_every_k,
                 temperature=1.0,
+                min_timestep=bd_min_timestep,
+                max_event_probability=bd_max_event_probability,
             )
         )
     elif bd_mode in ("flow_exact", "flow_birth_death") and target is not None:
@@ -127,6 +176,9 @@ def run_experiment_case(
                 every_k_steps=bd_every_k,
                 total_time=bd_total_time,
                 bandwidth=bd_bandwidth,
+                min_timestep=bd_min_timestep,
+                max_delta_tau=bd_max_delta_tau,
+                max_event_probability=bd_max_event_probability,
             )
         )
 
@@ -240,8 +292,8 @@ def main():
     parser.add_argument(
         "--fid-samples",
         type=int,
-        default=256,
-        help="Number of real & generated images for FID evaluation (set to 0 to disable FID)",
+        default=0,
+        help="Number of real & generated images for FID evaluation (default: 0 = disabled)",
     )
     parser.add_argument(
         "--no-fid",
@@ -256,6 +308,24 @@ def main():
     parser.add_argument("--device", default="auto")
     parser.add_argument(
         "--output-dir", default="reduced_kde_deliverable4_results"
+    )
+    parser.add_argument(
+        "--bd-min-timestep",
+        type=int,
+        default=100,
+        help="Minimum diffusion timestep for Birth-Death intervention (default: 100)",
+    )
+    parser.add_argument(
+        "--bd-max-event-prob",
+        type=float,
+        default=0.25,
+        help="Maximum fraction of population that can undergo BD per step (default: 0.25)",
+    )
+    parser.add_argument(
+        "--bd-max-time",
+        type=float,
+        default=0.005,
+        help="Maximum pseudo-time delta_tau per intervention (default: 0.005)",
     )
 
     # Dimensionality Reduction Flags
@@ -541,6 +611,9 @@ def main():
             noise_references=args.noise_references,
             bd_every_k=case["k"],
             bd_total_time=case["tau"],
+            bd_min_timestep=args.bd_min_timestep,
+            bd_max_delta_tau=args.bd_max_time,
+            bd_max_event_probability=args.bd_max_event_prob,
             real_images=real_images,
             fid_samples=args.fid_samples,
             fid_batch_size=args.fid_batch_size,
@@ -551,9 +624,11 @@ def main():
         # Save preview grid
         grid_norm = (preview.clamp(-1.0, 1.0) + 1.0) * 0.5
         save_image(grid_norm, samples_dir / f"{c_name}.png", nrow=4)
+        fid_disp = f" | FID: {rec['fid']}" if rec.get("fid") is not None else ""
+        mmd_disp = f" | MMD: {rec['mmd']}" if rec.get("mmd") is not None else ""
         print(
             f"   -> NFE: {rec['nfe']} | Time: {rec['elapsed_seconds']}s | "
-            f"Unique: {rec['unique_fraction']} | MMD: {rec.get('mmd')} | NLL: {rec.get('nll')} | FID: {rec['fid']}"
+            f"Unique: {rec['unique_fraction']:.4f}{mmd_disp}{fid_disp}"
         )
 
     # Save CSV
@@ -669,6 +744,30 @@ def main():
     if (out_dir / "plots").exists():
         print(f"    - Plots: {out_dir / 'plots'}/")
     print("=" * 80)
+
+    try:
+        import pandas as pd
+        df = pd.DataFrame(results)
+        cols = [
+            c
+            for c in [
+                "case_name",
+                "steps",
+                "bd_mode",
+                "unique_fraction",
+                "samples_per_second",
+                "elapsed_seconds",
+                "nfe",
+                "mmd",
+                "fid",
+            ]
+            if c in df.columns and (c != "fid" or args.fid_samples > 0)
+        ]
+        print("\n[+] Benchmark Summary Table:")
+        print(df[cols].to_string(index=False))
+        print("=" * 80)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

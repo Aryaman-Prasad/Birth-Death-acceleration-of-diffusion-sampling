@@ -150,6 +150,10 @@ class FlowBirthDeathAcceleration(SamplingModifier):
         every_k_steps: int = 1,
         total_time: float = 1.0,
         bandwidth: float = 0.3,
+        min_timestep: int | None = 100,
+        max_timestep: int | None = None,
+        max_delta_tau: float = 0.005,
+        max_event_probability: float = 0.25,
     ):
         if every_k_steps < 1:
             raise ValueError("every_k_steps must be positive")
@@ -160,6 +164,12 @@ class FlowBirthDeathAcceleration(SamplingModifier):
         self.every_k_steps = int(every_k_steps)
         self.total_time = float(total_time)
         self.bandwidth = float(bandwidth)
+        self.min_timestep = int(min_timestep) if min_timestep is not None else None
+        self.max_timestep = int(max_timestep) if max_timestep is not None else None
+        self.max_delta_tau = float(max_delta_tau)
+        self.max_event_probability = (
+            float(max_event_probability) if max_event_probability is not None else None
+        )
 
     def apply(
         self, state: SamplingState, *, model, scheduler, generator
@@ -181,15 +191,21 @@ class FlowBirthDeathAcceleration(SamplingModifier):
         if (context.step_index + 1) % self.every_k_steps != 0:
             return state
 
+        timestep = context.state_timestep
+        if timestep is not None:
+            if self.min_timestep is not None and timestep < self.min_timestep:
+                return state
+            if self.max_timestep is not None and timestep > self.max_timestep:
+                return state
+
         eligible_updates = context.num_steps - int(context.has_clean_endpoint)
         intervention_count = max(1, eligible_updates // self.every_k_steps)
-        delta_tau = self.total_time / intervention_count
+        raw_delta_tau = self.total_time / intervention_count
+        delta_tau = min(raw_delta_tau, self.max_delta_tau)
 
         population = samples.shape[0]
         if population < 2:
             return state
-
-        timestep = context.state_timestep
 
         # 1. Exact scalar log-density from the Flow model
         log_target = self.flow_target.log_prob(samples, int(timestep), scheduler)
@@ -206,6 +222,8 @@ class FlowBirthDeathAcceleration(SamplingModifier):
         beta = beta - beta.mean()
 
         event_probability = -torch.expm1(-beta.abs() * delta_tau)
+        if self.max_event_probability is not None and self.max_event_probability > 0:
+            event_probability = event_probability.clamp(max=self.max_event_probability)
         uniforms = torch.rand(population, device=samples.device, generator=generator)
         selected = uniforms < event_probability
         partners = torch.randint(

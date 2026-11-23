@@ -32,10 +32,45 @@ from diffusion.samplers import make_sampler
 from diffusion.schedulers import make_scheduler
 
 
-def _unique_fraction(samples: torch.Tensor) -> float:
-    flat = samples.reshape(samples.shape[0], -1)
-    unique_count = torch.unique(flat, dim=0).shape[0]
-    return float(unique_count / samples.shape[0])
+def _unique_fraction(samples: torch.Tensor, threshold: float = 0.05) -> float:
+    """Calculates the fraction of perceptually unique images in a batch.
+
+    Images are normalized to [0, 1]. Two images whose Mean Absolute Error (MAE)
+    is below `threshold` (default 0.05, i.e. 5% average pixel difference) are
+    detected as duplicate/repeating modes from the same parent particle.
+    """
+    N = samples.shape[0]
+    if N <= 1:
+        return 1.0
+
+    s = samples.detach().float()
+    s_min = (
+        s.amin(dim=(1, 2, 3), keepdim=True)
+        if s.ndim == 4
+        else s.amin(dim=1, keepdim=True)
+    )
+    s_max = (
+        s.amax(dim=(1, 2, 3), keepdim=True)
+        if s.ndim == 4
+        else s.amax(dim=1, keepdim=True)
+    )
+    denom = (s_max - s_min).clamp_min(1e-6)
+    normed = (s - s_min) / denom
+    flat = normed.reshape(N, -1)
+
+    # Pairwise Mean Absolute Error (MAE) across all pixels
+    mae_matrix = torch.cdist(flat, flat, p=1) / flat.shape[1]
+
+    unique_mask = torch.ones(N, dtype=torch.bool, device=samples.device)
+    for i in range(N):
+        if not unique_mask[i]:
+            continue
+        for j in range(i + 1, N):
+            if unique_mask[j] and mae_matrix[i, j] < threshold:
+                unique_mask[j] = False
+
+    unique_count = int(unique_mask.sum().item())
+    return float(unique_count / N)
 
 
 def run_smc_case(
@@ -52,8 +87,11 @@ def run_smc_case(
     every_k: int = 2,
     total_time: float = 0.01,
     temperature: float = 1.0,
+    min_timestep: int | None = 100,
+    max_delta_tau: float = 0.005,
+    max_event_probability: float = 0.25,
     real_images: torch.Tensor | None = None,
-    fid_samples: int = 256,
+    fid_samples: int = 0,
     fid_batch_size: int = 32,
 ):
     """Executes a single sampling case with latency, NFE, diversity, MMD, and FID."""
@@ -67,6 +105,9 @@ def run_smc_case(
                 every_k_steps=every_k,
                 total_time=total_time,
                 temperature=temperature,
+                min_timestep=min_timestep,
+                max_delta_tau=max_delta_tau,
+                max_event_probability=max_event_probability,
             )
         )
 
@@ -152,8 +193,8 @@ def main():
     parser.add_argument(
         "--fid-samples",
         type=int,
-        default=512,
-        help="Number of real & generated images for FID evaluation",
+        default=0,
+        help="Number of real & generated images for FID evaluation (default: 0 = disabled)",
     )
     parser.add_argument("--no-fid", action="store_true")
     parser.add_argument("--fid-batch-size", type=int, default=32)
@@ -164,6 +205,24 @@ def main():
     parser.add_argument("--smc-every-k", type=int, default=2)
     parser.add_argument("--smc-total-time", type=float, default=0.01)
     parser.add_argument("--smc-temp", type=float, default=1.0)
+    parser.add_argument(
+        "--bd-min-timestep",
+        type=int,
+        default=100,
+        help="Minimum diffusion timestep for Birth-Death intervention (default: 100)",
+    )
+    parser.add_argument(
+        "--bd-max-event-prob",
+        type=float,
+        default=0.25,
+        help="Maximum fraction of population that can undergo BD per step (default: 0.25)",
+    )
+    parser.add_argument(
+        "--bd-max-time",
+        type=float,
+        default=0.005,
+        help="Maximum pseudo-time delta_tau per intervention (default: 0.005)",
+    )
     parser.add_argument("--output-dir", default="smc_benchmark_results")
 
     args = parser.parse_args()
@@ -242,7 +301,9 @@ def main():
         results.append(rec_base)
         grid_base = (prev_base.clamp(-1.0, 1.0) + 1.0) * 0.5
         save_image(grid_base, samples_dir / f"{case_name_base}.png", nrow=4)
-        print(f"   -> Samples/s: {rec_base['samples_per_second']} | Unique: {rec_base['unique_fraction']} | MMD: {rec_base.get('mmd')} | FID: {rec_base.get('fid')}")
+        fid_disp_base = f" | FID: {rec_base['fid']}" if rec_base.get("fid") is not None else ""
+        mmd_disp_base = f" | MMD: {rec_base['mmd']}" if rec_base.get("mmd") is not None else ""
+        print(f"   -> Samples/s: {rec_base['samples_per_second']} | Unique: {rec_base['unique_fraction']:.4f} | NFE: {rec_base['nfe']}{mmd_disp_base}{fid_disp_base}")
 
         # B) SMC Reverse Transition Weighting
         case_name_smc = f"ddim_{st}_smc_transition"
@@ -260,6 +321,9 @@ def main():
             every_k=args.smc_every_k,
             total_time=args.smc_total_time,
             temperature=args.smc_temp,
+            min_timestep=args.bd_min_timestep,
+            max_delta_tau=args.bd_max_time,
+            max_event_probability=args.bd_max_event_prob,
             real_images=real_images,
             fid_samples=args.fid_samples,
             fid_batch_size=args.fid_batch_size,
@@ -268,7 +332,9 @@ def main():
         results.append(rec_smc)
         grid_smc = (prev_smc.clamp(-1.0, 1.0) + 1.0) * 0.5
         save_image(grid_smc, samples_dir / f"{case_name_smc}.png", nrow=4)
-        print(f"   -> Samples/s: {rec_smc['samples_per_second']} | Unique: {rec_smc['unique_fraction']} | MMD: {rec_smc.get('mmd')} | FID: {rec_smc.get('fid')}")
+        fid_disp = f" | FID: {rec_smc['fid']}" if rec_smc.get("fid") is not None else ""
+        mmd_disp = f" | MMD: {rec_smc['mmd']}" if rec_smc.get("mmd") is not None else ""
+        print(f"   -> Samples/s: {rec_smc['samples_per_second']} | Unique: {rec_smc['unique_fraction']:.4f} | NFE: {rec_smc['nfe']}{mmd_disp}{fid_disp}")
 
     # Save CSV and JSON
     csv_file = out_dir / "smc_benchmark_results.csv"
@@ -339,6 +405,30 @@ def main():
     print(f"    - JSON:  {json_file}")
     print(f"    - Grids: {samples_dir}/")
     print("=" * 80)
+
+    try:
+        import pandas as pd
+        df = pd.DataFrame(results)
+        cols = [
+            c
+            for c in [
+                "case_name",
+                "steps",
+                "method",
+                "unique_fraction",
+                "samples_per_second",
+                "elapsed_seconds",
+                "nfe",
+                "mmd",
+                "fid",
+            ]
+            if c in df.columns and (c != "fid" or args.fid_samples > 0)
+        ]
+        print("\n[+] Benchmark Summary Table:")
+        print(df[cols].to_string(index=False))
+        print("=" * 80)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

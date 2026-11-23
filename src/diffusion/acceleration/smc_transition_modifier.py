@@ -42,6 +42,10 @@ class SMCTransitionLikelihoodAcceleration(SamplingModifier):
         total_time: float = 1.0,
         temperature: float = 1.0,
         divergence_penalty: float = 0.0,
+        min_timestep: int | None = 100,
+        max_timestep: int | None = None,
+        max_delta_tau: float = 0.005,
+        max_event_probability: float = 0.25,
     ):
         if every_k_steps < 1:
             raise ValueError("every_k_steps must be positive")
@@ -54,6 +58,12 @@ class SMCTransitionLikelihoodAcceleration(SamplingModifier):
         self.total_time = float(total_time)
         self.temperature = float(temperature)
         self.divergence_penalty = float(divergence_penalty)
+        self.min_timestep = int(min_timestep) if min_timestep is not None else None
+        self.max_timestep = int(max_timestep) if max_timestep is not None else None
+        self.max_delta_tau = float(max_delta_tau)
+        self.max_event_probability = (
+            float(max_event_probability) if max_event_probability is not None else None
+        )
         self._previous_samples: torch.Tensor | None = None
         self._previous_timestep: int | None = None
 
@@ -150,9 +160,26 @@ class SMCTransitionLikelihoodAcceleration(SamplingModifier):
             self._previous_timestep = state.timestep
             return state
 
+        # Check timestep window restrictions
+        curr_t = (
+            self._previous_timestep
+            if self._previous_timestep is not None
+            else state.timestep
+        )
+        if curr_t is not None:
+            if self.min_timestep is not None and curr_t < self.min_timestep:
+                self._previous_samples = samples.detach().clone()
+                self._previous_timestep = state.timestep
+                return state
+            if self.max_timestep is not None and curr_t > self.max_timestep:
+                self._previous_samples = samples.detach().clone()
+                self._previous_timestep = state.timestep
+                return state
+
         eligible_updates = context.num_steps - int(context.has_clean_endpoint)
         intervention_count = max(1, eligible_updates // self.every_k_steps)
-        delta_tau = self.total_time / intervention_count
+        raw_delta_tau = self.total_time / intervention_count
+        delta_tau = min(raw_delta_tau, self.max_delta_tau)
 
         population = samples.shape[0]
         if population < 2:
@@ -172,6 +199,8 @@ class SMCTransitionLikelihoodAcceleration(SamplingModifier):
         beta = -centered_log_prob  # low prob -> beta > 0 (kill)
 
         event_probability = -torch.expm1(-beta.abs() * delta_tau)
+        if self.max_event_probability is not None and self.max_event_probability > 0:
+            event_probability = event_probability.clamp(max=self.max_event_probability)
         uniforms = torch.rand(population, device=samples.device, generator=generator)
         selected = uniforms < event_probability
         partners = torch.randint(

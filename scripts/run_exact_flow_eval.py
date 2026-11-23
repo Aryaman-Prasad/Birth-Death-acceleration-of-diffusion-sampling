@@ -31,12 +31,67 @@ from diffusion.pipeline import SamplingPipeline
 from diffusion.samplers import make_sampler
 from diffusion.schedulers import make_scheduler
 from diffusion.targets import EmpiricalNoisedDataTarget
+from diffusion.targets.base import TargetDistribution
 
 
-def _unique_fraction(samples: torch.Tensor) -> float:
-    flat = samples.reshape(samples.shape[0], -1)
-    unique_count = torch.unique(flat, dim=0).shape[0]
-    return float(unique_count / samples.shape[0])
+def _unique_fraction(samples: torch.Tensor, threshold: float = 0.05) -> float:
+    """Calculates the fraction of perceptually unique images in a batch.
+
+    Images are normalized to [0, 1]. Two images whose Mean Absolute Error (MAE)
+    is below `threshold` (default 0.05, i.e. 5% average pixel difference) are
+    detected as duplicate/repeating modes from the same parent particle.
+    """
+    N = samples.shape[0]
+    if N <= 1:
+        return 1.0
+
+    s = samples.detach().float()
+    s_min = (
+        s.amin(dim=(1, 2, 3), keepdim=True)
+        if s.ndim == 4
+        else s.amin(dim=1, keepdim=True)
+    )
+    s_max = (
+        s.amax(dim=(1, 2, 3), keepdim=True)
+        if s.ndim == 4
+        else s.amax(dim=1, keepdim=True)
+    )
+    denom = (s_max - s_min).clamp_min(1e-6)
+    normed = (s - s_min) / denom
+    flat = normed.reshape(N, -1)
+
+    # Pairwise Mean Absolute Error (MAE) across all pixels
+    mae_matrix = torch.cdist(flat, flat, p=1) / flat.shape[1]
+
+    unique_mask = torch.ones(N, dtype=torch.bool, device=samples.device)
+    for i in range(N):
+        if not unique_mask[i]:
+            continue
+        for j in range(i + 1, N):
+            if unique_mask[j] and mae_matrix[i, j] < threshold:
+                unique_mask[j] = False
+
+    unique_count = int(unique_mask.sum().item())
+    return float(unique_count / N)
+
+
+class TractableFlowTarget(nn.Module, TargetDistribution):
+    """Analytical tractable flow target (exact standard Gaussian marginal) for standalone flow BD."""
+
+    state_coordinates = "x_t"
+
+    def __init__(self, prior_std: float = 1.0):
+        super().__init__()
+        self.prior_std = float(prior_std)
+
+    def log_prob(self, samples: torch.Tensor, timestep: int, scheduler) -> torch.Tensor:
+        flat = samples.reshape(samples.shape[0], -1)
+        dim = flat.shape[1]
+        variance = self.prior_std**2
+        return -0.5 * dim * math.log(2 * math.pi * variance) - 0.5 * flat.square().sum(dim=1) / variance
+
+    def score(self, samples: torch.Tensor, timestep: int, scheduler) -> torch.Tensor:
+        return -samples / (self.prior_std**2)
 
 
 def run_flow_case(
@@ -54,8 +109,11 @@ def run_flow_case(
     every_k: int = 2,
     total_time: float = 0.01,
     bandwidth: float = 0.3,
+    min_timestep: int | None = 100,
+    max_delta_tau: float = 0.005,
+    max_event_probability: float = 0.25,
     real_images: torch.Tensor | None = None,
-    fid_samples: int = 256,
+    fid_samples: int = 0,
     fid_batch_size: int = 32,
 ):
     """Executes a single sampling case with latency, NFE, diversity, MMD, and FID."""
@@ -70,6 +128,9 @@ def run_flow_case(
                 every_k_steps=every_k,
                 total_time=total_time,
                 bandwidth=bandwidth,
+                min_timestep=min_timestep,
+                max_delta_tau=max_delta_tau,
+                max_event_probability=max_event_probability,
             )
         )
 
@@ -155,8 +216,8 @@ def main():
     parser.add_argument(
         "--fid-samples",
         type=int,
-        default=512,
-        help="Number of real & generated images for FID evaluation",
+        default=0,
+        help="Number of real & generated images for FID evaluation (default: 0 = disabled)",
     )
     parser.add_argument("--no-fid", action="store_true")
     parser.add_argument("--fid-batch-size", type=int, default=32)
@@ -167,6 +228,24 @@ def main():
     parser.add_argument("--flow-every-k", type=int, default=2)
     parser.add_argument("--flow-total-time", type=float, default=0.01)
     parser.add_argument("--flow-bandwidth", type=float, default=0.3)
+    parser.add_argument(
+        "--bd-min-timestep",
+        type=int,
+        default=100,
+        help="Minimum diffusion timestep for Birth-Death intervention (default: 100)",
+    )
+    parser.add_argument(
+        "--bd-max-event-prob",
+        type=float,
+        default=0.25,
+        help="Maximum fraction of population that can undergo BD per step (default: 0.25)",
+    )
+    parser.add_argument(
+        "--bd-max-time",
+        type=float,
+        default=0.005,
+        help="Maximum pseudo-time delta_tau per intervention (default: 0.005)",
+    )
     parser.add_argument("--output-dir", default="exact_flow_benchmark_results")
 
     args = parser.parse_args()
@@ -224,6 +303,9 @@ def main():
 
         # Build density target from the FID real images
         target = EmpiricalNoisedDataTarget(real_images, reference_chunk_size=64)
+    else:
+        # Standalone tractable continuous flow target
+        target = TractableFlowTarget()
 
     # 3. Run Benchmark Cases
     results = []
@@ -250,7 +332,9 @@ def main():
         results.append(rec_base)
         grid_base = (prev_base.clamp(-1.0, 1.0) + 1.0) * 0.5
         save_image(grid_base, samples_dir / f"{case_name_base}.png", nrow=4)
-        print(f"   -> Samples/s: {rec_base['samples_per_second']} | Unique: {rec_base['unique_fraction']} | MMD: {rec_base.get('mmd')} | FID: {rec_base.get('fid')}")
+        fid_disp_b = f" | FID: {rec_base['fid']}" if rec_base.get("fid") is not None else ""
+        mmd_disp_b = f" | MMD: {rec_base['mmd']}" if rec_base.get("mmd") is not None else ""
+        print(f"   -> Samples/s: {rec_base['samples_per_second']} | Unique: {rec_base['unique_fraction']:.4f} | NFE: {rec_base['nfe']}{mmd_disp_b}{fid_disp_b}")
 
         # B) Exact Flow Birth-Death
         case_name_flow = f"ddim_{st}_flow_exact"
@@ -269,6 +353,9 @@ def main():
             every_k=args.flow_every_k,
             total_time=args.flow_total_time,
             bandwidth=args.flow_bandwidth,
+            min_timestep=args.bd_min_timestep,
+            max_delta_tau=args.bd_max_time,
+            max_event_probability=args.bd_max_event_prob,
             real_images=real_images,
             fid_samples=args.fid_samples,
             fid_batch_size=args.fid_batch_size,
@@ -277,7 +364,9 @@ def main():
         results.append(rec_flow)
         grid_flow = (prev_flow.clamp(-1.0, 1.0) + 1.0) * 0.5
         save_image(grid_flow, samples_dir / f"{case_name_flow}.png", nrow=4)
-        print(f"   -> Samples/s: {rec_flow['samples_per_second']} | Unique: {rec_flow['unique_fraction']} | MMD: {rec_flow.get('mmd')} | FID: {rec_flow.get('fid')}")
+        fid_disp_f = f" | FID: {rec_flow['fid']}" if rec_flow.get("fid") is not None else ""
+        mmd_disp_f = f" | MMD: {rec_flow['mmd']}" if rec_flow.get("mmd") is not None else ""
+        print(f"   -> Samples/s: {rec_flow['samples_per_second']} | Unique: {rec_flow['unique_fraction']:.4f} | NFE: {rec_flow['nfe']}{mmd_disp_f}{fid_disp_f}")
 
     # Save CSV and JSON
     csv_file = out_dir / "exact_flow_benchmark_results.csv"
@@ -351,6 +440,30 @@ def main():
     print(f"    - JSON:  {json_file}")
     print(f"    - Grids: {samples_dir}/")
     print("=" * 80)
+
+    try:
+        import pandas as pd
+        df = pd.DataFrame(results)
+        cols = [
+            c
+            for c in [
+                "case_name",
+                "steps",
+                "method",
+                "unique_fraction",
+                "samples_per_second",
+                "elapsed_seconds",
+                "nfe",
+                "mmd",
+                "fid",
+            ]
+            if c in df.columns and (c != "fid" or args.fid_samples > 0)
+        ]
+        print("\n[+] Benchmark Summary Table:")
+        print(df[cols].to_string(index=False))
+        print("=" * 80)
+    except Exception:
+        pass
 
 
 if __name__ == "__main__":

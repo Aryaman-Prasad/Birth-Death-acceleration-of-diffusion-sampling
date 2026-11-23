@@ -40,6 +40,9 @@ class ParticleFilteringSolutionSpaceExplorer(SamplingModifier):
         every_k_steps: int = 2,
         temperature: float = 1.0,
         diversity_weight: float = 0.1,
+        min_timestep: int | None = 100,
+        max_timestep: int | None = None,
+        max_event_probability: float = 0.25,
     ):
         if branch_factor < 2:
             raise ValueError("branch_factor must be at least 2 to explore alternative paths")
@@ -52,6 +55,11 @@ class ParticleFilteringSolutionSpaceExplorer(SamplingModifier):
         self.every_k_steps = int(every_k_steps)
         self.temperature = float(temperature)
         self.diversity_weight = float(diversity_weight)
+        self.min_timestep = int(min_timestep) if min_timestep is not None else None
+        self.max_timestep = int(max_timestep) if max_timestep is not None else None
+        self.max_event_probability = (
+            float(max_event_probability) if max_event_probability is not None else None
+        )
 
     def _explore_solution_branches(
         self,
@@ -142,8 +150,14 @@ class ParticleFilteringSolutionSpaceExplorer(SamplingModifier):
         if (context.step_index + 1) % self.every_k_steps != 0:
             return state
 
-        N = samples.shape[0]
         timestep = state.timestep
+        if timestep is not None:
+            if self.min_timestep is not None and timestep < self.min_timestep:
+                return state
+            if self.max_timestep is not None and timestep > self.max_timestep:
+                return state
+
+        N = samples.shape[0]
         prev_timestep = state.previous_timestep
 
         # 1. Branch and explore solution space
@@ -151,18 +165,59 @@ class ParticleFilteringSolutionSpaceExplorer(SamplingModifier):
             samples, timestep, prev_timestep, model, scheduler, generator=generator
         )
 
-        # 2. Combined Birth-Death Selection over the N*B candidate solution space
-        total_pool_size = candidates.shape[0]  # N * B
-        logits = potentials / self.temperature
-        weights = torch.softmax(logits, dim=0)
-
-        # Systematic / multinomial sampling according to importance weights
-        # Select best N particles to survive back into the population
-        top_k_indices = torch.multinomial(
-            weights, num_samples=N, replacement=False, generator=generator
+        # 2. Candidate Selection preserving population diversity:
+        # Each parent particle i selects its best exploratory candidate branch
+        B = self.branch_factor
+        potentials_reshaped = potentials.reshape(B, N)
+        branch_weights = torch.softmax(potentials_reshaped / self.temperature, dim=0)
+        chosen_branches = torch.multinomial(
+            branch_weights.T, num_samples=1, generator=generator
+        ).squeeze(-1)  # (N,)
+        chosen_indices = chosen_branches * N + torch.arange(
+            N, device=samples.device
         )
+        surviving_samples = candidates.index_select(0, chosen_indices)
+        surviving_potentials = potentials.index_select(0, chosen_indices)
 
-        filtered_samples = candidates.index_select(0, top_k_indices)
+        # 3. Controlled Birth-Death cross-particle exchange (strictly capped to prevent collapse)
+        if self.max_event_probability is not None and self.max_event_probability > 0:
+            centered_pot = surviving_potentials - surviving_potentials.mean()
+            beta = -centered_pot  # low potential -> beta > 0 (kill)
+            event_probability = (-torch.expm1(-beta.abs() * 0.005)).clamp(
+                max=self.max_event_probability
+            )
+            uniforms = torch.rand(N, device=samples.device, generator=generator)
+            selected = uniforms < event_probability
+            partners = torch.randint(
+                N - 1, (N,), device=samples.device, generator=generator
+            )
+
+            event_data = torch.stack(
+                (
+                    selected.to(torch.float32),
+                    beta.gt(0).to(torch.float32),
+                    partners.to(torch.float32),
+                ),
+                dim=1,
+            ).cpu().tolist()
+
+            source_indices = list(range(N))
+            for idx, (is_sel, is_over, raw_partner) in enumerate(event_data):
+                if not is_sel:
+                    continue
+                partner = int(raw_partner)
+                if partner >= idx:
+                    partner += 1
+                if is_over:
+                    source_indices[idx] = source_indices[partner]
+                else:
+                    source_indices[partner] = source_indices[idx]
+
+            filtered_samples = surviving_samples.index_select(
+                0, torch.tensor(source_indices, device=samples.device, dtype=torch.long)
+            )
+        else:
+            filtered_samples = surviving_samples
 
         metadata = dict(state.metadata)
         metadata.update(

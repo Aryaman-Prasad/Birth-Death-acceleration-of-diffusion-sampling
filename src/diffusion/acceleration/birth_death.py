@@ -24,8 +24,18 @@ class BirthDeathAcceleration(SamplingModifier):
     original Langevin paper.
     """
 
-    def __init__(self, target: TargetDistribution, kernel_bandwidth: float = 0.3,
-                 *, every_k_steps: int = 1, total_time: float = 1.0):
+    def __init__(
+        self,
+        target: TargetDistribution,
+        kernel_bandwidth: float = 0.3,
+        *,
+        every_k_steps: int = 1,
+        total_time: float = 1.0,
+        min_timestep: int | None = 100,
+        max_timestep: int | None = None,
+        max_delta_tau: float = 0.005,
+        max_event_probability: float = 0.25,
+    ):
         if kernel_bandwidth <= 0:
             raise ValueError("kernel_bandwidth must be positive")
         if every_k_steps < 1:
@@ -36,6 +46,12 @@ class BirthDeathAcceleration(SamplingModifier):
         self.kernel_bandwidth = float(kernel_bandwidth)
         self.every_k_steps = int(every_k_steps)
         self.total_time = float(total_time)
+        self.min_timestep = int(min_timestep) if min_timestep is not None else None
+        self.max_timestep = int(max_timestep) if max_timestep is not None else None
+        self.max_delta_tau = float(max_delta_tau)
+        self.max_event_probability = (
+            float(max_event_probability) if max_event_probability is not None else None
+        )
 
     def _target_coordinates(self, samples: torch.Tensor, context: SamplingContext,
                              scheduler) -> torch.Tensor:
@@ -79,16 +95,23 @@ class BirthDeathAcceleration(SamplingModifier):
         if (context.step_index + 1) % self.every_k_steps != 0:
             return state
 
+        timestep = context.state_timestep
+        if timestep is not None:
+            if self.min_timestep is not None and timestep < self.min_timestep:
+                return state
+            if self.max_timestep is not None and timestep > self.max_timestep:
+                return state
+
         eligible_updates = context.num_steps - int(context.has_clean_endpoint)
         intervention_count = eligible_updates // self.every_k_steps
         if intervention_count < 1:
             return state
-        delta_tau = self.total_time / intervention_count
+        raw_delta_tau = self.total_time / intervention_count
+        delta_tau = min(raw_delta_tau, self.max_delta_tau)
 
         population = samples.shape[0]
         if population < 2:
             raise ValueError("birth-death updates require at least two particles")
-        timestep = context.state_timestep
         target_samples = self._target_coordinates(samples, context, scheduler)
 
         flat = target_samples.reshape(population, -1)
@@ -106,6 +129,8 @@ class BirthDeathAcceleration(SamplingModifier):
         beta = beta - beta.mean()
 
         event_probability = -torch.expm1(-beta.abs() * delta_tau)
+        if self.max_event_probability is not None and self.max_event_probability > 0:
+            event_probability = event_probability.clamp(max=self.max_event_probability)
         uniforms = torch.rand(population, device=samples.device, generator=generator)
         selected = uniforms < event_probability
         partners = torch.randint(population - 1, (population,), device=samples.device,
