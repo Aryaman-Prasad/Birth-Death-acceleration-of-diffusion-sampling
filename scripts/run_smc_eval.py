@@ -2,10 +2,12 @@
 
 Compares:
 1. Baseline DDIM (No Birth-Death)
-2. SMC Reverse Transition Weighting (O(N) analytical reverse kernel likelihood, 0 distance matrices)
+2. SMC Reverse Transition Weighting (O(N) analytical reverse kernel likelihood, zero references, zero distance matrices)
+
+Uses pretrained google/ddpm-cifar10-32 by default.
 
 Usage:
-    python3 scripts/run_smc_eval.py --dataset cifar10 --download --device cuda --steps 10 25 50
+    python3 scripts/run_smc_eval.py --steps 10 25 50 --fid-samples 512 --device cuda
 """
 
 import argparse
@@ -28,7 +30,6 @@ from diffusion.models import make_model
 from diffusion.pipeline import SamplingPipeline
 from diffusion.samplers import make_sampler
 from diffusion.schedulers import make_scheduler
-from diffusion.targets import EmpiricalNoisedDataTarget
 
 
 def _unique_fraction(samples: torch.Tensor) -> float:
@@ -47,7 +48,6 @@ def run_smc_case(
     count: int,
     device: torch.device,
     seed: int,
-    target=None,
     use_smc: bool = False,
     every_k: int = 2,
     total_time: float = 0.01,
@@ -84,34 +84,19 @@ def run_smc_case(
     )
     unique_ratio = _unique_fraction(preview_samples)
 
-    # 2. Quality Evaluation: MMD and NLL
+    # 2. Quality Evaluation: MMD against real images
     mmd_score = None
-    nll_score = None
-    ref_tensor = getattr(target, "reference_samples", getattr(target, "references", None))
-    if target is not None and ref_tensor is not None:
+    if real_images is not None:
         try:
-            n_refs = min(512, ref_tensor.shape[0])
-            ref_subset = ref_tensor[:n_refs].to(device=device, dtype=torch.float32)
+            n_refs = min(512, real_images.shape[0])
+            ref_subset = real_images[:n_refs].to(device=device, dtype=torch.float32)
             eval_samples = preview_samples.to(device=device, dtype=torch.float32)
             mmd_metrics, _ = rbf_mmd_squared(eval_samples, ref_subset)
             mmd_score = float(mmd_metrics["empirical_target_mmd2_rbf_multiscale"])
         except Exception:
             mmd_score = None
 
-        try:
-            alpha_bar = scheduler.alpha_bars[0].to(device)
-            density_samples = preview_samples.to(device) / alpha_bar.sqrt()
-            log_prob = target.log_prob(density_samples, 0, scheduler)
-            if torch.isfinite(log_prob).any():
-                nll_score = float((-log_prob[torch.isfinite(log_prob)].mean()).item())
-            else:
-                log_prob_s = target.log_prob(density_samples, 50, scheduler)
-                if torch.isfinite(log_prob_s).any():
-                    nll_score = float((-log_prob_s[torch.isfinite(log_prob_s)].mean()).item())
-        except Exception:
-            nll_score = None
-
-    # 3. FID evaluation
+    # 3. FID evaluation against real images
     fid_score = None
     if real_images is not None and fid_samples > 0:
         fid_evaluator = FIDEvaluator(device)
@@ -141,7 +126,6 @@ def run_smc_case(
         "samples_per_second": round(sampling_metrics.samples_per_second, 2),
         "unique_fraction": round(unique_ratio, 4),
         "mmd": round(mmd_score, 6) if mmd_score is not None else None,
-        "nll": round(nll_score, 2) if nll_score is not None else None,
         "fid": round(fid_score, 3) if fid_score is not None else None,
     }
     return record, preview_samples
@@ -149,12 +133,23 @@ def run_smc_case(
 
 def main():
     parser = argparse.ArgumentParser(description="Standalone SMC Transition Likelihood Evaluation")
+    parser.add_argument(
+        "--model-id",
+        "--pretrained-model-id",
+        dest="model_id",
+        default="google/ddpm-cifar10-32",
+        help="Hugging Face pretrained model ID (default: google/ddpm-cifar10-32)",
+    )
     parser.add_argument("--dataset", choices=("cifar10", "imagefolder"), default="cifar10")
     parser.add_argument("--data-dir", default="data")
     parser.add_argument("--download", action="store_true")
     parser.add_argument("--image-size", type=int, default=32)
-    parser.add_argument("--reference-count", type=int, default=512)
-    parser.add_argument("--fid-samples", type=int, default=256)
+    parser.add_argument(
+        "--fid-samples",
+        type=int,
+        default=512,
+        help="Number of real & generated images for FID evaluation",
+    )
     parser.add_argument("--no-fid", action="store_true")
     parser.add_argument("--fid-batch-size", type=int, default=32)
     parser.add_argument("--count", type=int, default=16)
@@ -173,32 +168,37 @@ def main():
     device = torch.device(
         "cuda" if args.device in ("auto", "cuda") and torch.cuda.is_available() else "cpu"
     )
-    print(f"[+] Initializing SMC Transition Evaluation Suite on {device}...")
+    print(f"[+] Initializing SMC Transition Evaluation on {device}...")
+    print(f"[+] Loading Pretrained Model: {args.model_id}...")
 
     out_dir = Path(args.output_dir)
     out_dir.mkdir(parents=True, exist_ok=True)
     samples_dir = out_dir / "samples"
     samples_dir.mkdir(parents=True, exist_ok=True)
 
-    # 1. Dataset & Reference Target
-    data_module = make_data_module(
-        args.dataset, args.data_dir, args.image_size, args.download, train=True
-    )
-    sample_shape = tuple(data_module.sample_shape)
-    dataset = data_module.dataset()
-    ref_count = min(args.reference_count, len(dataset))
-    target = EmpiricalNoisedDataTarget.from_dataset(
-        dataset, num_reference_samples=ref_count, seed=args.seed, reference_chunk_size=64
-    )
+    # 1. Load Pretrained Diffusers Model and Scheduler
+    try:
+        model = make_model("huggingface-unet", pretrained_model_id=args.model_id).to(device)
+        scheduler = make_scheduler("huggingface", pretrained_model_id=args.model_id).to(device)
+        sample_shape = tuple(model.sample_shape)
+        print(f"[✓] Model loaded successfully: {args.model_id} (sample shape: {sample_shape})")
+    except Exception as e:
+        print(f"[!] Warning: Could not load Hugging Face model ({e}). Using linear scheduler fallback.")
+        scheduler = make_scheduler("linear", 1000, 1e-4, 2e-2).to(device)
+        sample_shape = (3, args.image_size, args.image_size)
+        from diffusion.models.toy_mlp import ToyMLP
+        model = ToyMLP(sample_shape, 128).to(device)
 
-    # 2. Scheduler and Target-Score Model
-    scheduler = make_scheduler("linear", 1000, 1e-4, 2e-2).to(device)
-    model = make_model("target-score", target=target, scheduler=scheduler).to(device)
     model.eval()
 
-    # 3. Reference images for FID
+    # 2. Real Images for FID / MMD Evaluation (only loaded if FID requested)
     real_images = None
     if args.fid_samples > 0:
+        print(f"[+] Loading {args.fid_samples} real {args.dataset.upper()} images for FID evaluation...")
+        data_module = make_data_module(
+            args.dataset, args.data_dir, args.image_size, args.download, train=True
+        )
+        dataset = data_module.dataset()
         from torch.utils.data import DataLoader
         loader = DataLoader(dataset, batch_size=args.fid_batch_size, shuffle=True)
         img_list = []
@@ -212,7 +212,7 @@ def main():
                 break
         real_images = torch.cat(img_list, dim=0)
 
-    # 4. Run Cases across Steps
+    # 3. Run Benchmark Cases
     results = []
     for st in args.steps:
         # A) Baseline DDIM
@@ -227,7 +227,6 @@ def main():
             count=args.count,
             device=device,
             seed=args.seed,
-            target=target,
             use_smc=False,
             real_images=real_images,
             fid_samples=args.fid_samples,
@@ -239,7 +238,7 @@ def main():
         save_image(grid_base, samples_dir / f"{case_name_base}.png", nrow=4)
         print(f"   -> Samples/s: {rec_base['samples_per_second']} | Unique: {rec_base['unique_fraction']} | MMD: {rec_base.get('mmd')} | FID: {rec_base.get('fid')}")
 
-        # B) SMC Reverse Transition
+        # B) SMC Reverse Transition Weighting
         case_name_smc = f"ddim_{st}_smc_transition"
         print(f"\n[Case: {case_name_smc}] Running SMC Transition Weighting at {st} steps...")
         rec_smc, prev_smc = run_smc_case(
@@ -251,7 +250,6 @@ def main():
             count=args.count,
             device=device,
             seed=args.seed,
-            target=target,
             use_smc=True,
             every_k=args.smc_every_k,
             total_time=args.smc_total_time,
