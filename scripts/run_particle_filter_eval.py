@@ -140,20 +140,25 @@ def run_pf_case(
     # 3. FID evaluation
     fid_score = None
     if real_images is not None and fid_samples > 0:
-        fid_evaluator = FIDEvaluator(device)
-        for start in range(0, real_images.shape[0], fid_batch_size):
-            chunk = real_images[start : start + fid_batch_size].to(device)
-            fid_evaluator.update_real(chunk)
+        try:
+            n_fid = min(fid_samples, real_images.shape[0])
+            fid_evaluator = FIDEvaluator(device)
+            for start in range(0, n_fid, fid_batch_size):
+                chunk = real_images[start : min(start + fid_batch_size, n_fid)].to(device)
+                fid_evaluator.update_real(chunk)
 
-        remaining = fid_samples
-        fid_gen = torch.Generator(device=device).manual_seed(seed + 999)
-        while remaining > 0:
-            b_count = min(fid_batch_size, remaining)
-            b_shape = (b_count, *sample_shape)
-            fake_batch = pipeline.sample(model, b_shape, device, steps, fid_gen)
-            fid_evaluator.update_fake(fake_batch)
-            remaining -= b_count
-        fid_score = float(fid_evaluator.compute())
+            remaining = n_fid
+            fid_gen = torch.Generator(device=device).manual_seed(seed + 999)
+            while remaining > 0:
+                b_count = min(fid_batch_size, remaining)
+                b_shape = (b_count, *sample_shape)
+                fake_batch = pipeline.sample(model, b_shape, device, steps, fid_gen)
+                fid_evaluator.update_fake(fake_batch)
+                remaining -= b_count
+            fid_score = float(fid_evaluator.compute())
+        except Exception as e:
+            print(f"[!] Warning: FID evaluation encountered an error ({e})")
+            fid_score = None
 
     record = {
         "sampler": "ddim",
