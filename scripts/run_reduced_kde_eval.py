@@ -303,6 +303,13 @@ def main():
         help="list of diffusion inference step counts to evaluate (e.g. --steps 5 10 20 25 30 40 50)",
     )
     parser.add_argument(
+        "--methods",
+        nargs="+",
+        type=str,
+        default=None,
+        help="explicit methods to benchmark across steps: baseline, pixel_kde, smc, particle_filter, pixel_pca, reduced_kde",
+    )
+    parser.add_argument(
         "--include-steps-10",
         action="store_true",
         help="include 10-step comparison cases in the benchmark sweep",
@@ -388,17 +395,43 @@ def main():
         if args.include_steps_10:
             step_list.insert(0, 10)
 
+    if args.methods is not None:
+        raw_methods = []
+        for m in args.methods:
+            m_clean = m.lower().replace("-", "_")
+            if m_clean in ("baseline", "none"):
+                raw_methods.append("none")
+            elif m_clean in ("pixel_kde", "pixel", "highdim"):
+                raw_methods.append("pixel_kde")
+            elif m_clean in ("smc", "smc_transition", "smc_likelihood"):
+                raw_methods.append("smc_transition")
+            elif m_clean in ("particle_filter", "pf", "explorer"):
+                raw_methods.append("particle_filter")
+            elif m_clean in ("pixel_pca", "pca"):
+                raw_methods.append("pixel_pca")
+            elif m_clean in ("reduced_kde", "unet", "unet_kde"):
+                raw_methods.append("reduced_kde")
+    elif args.compare_all_paradigms:
+        raw_methods = ["none", "pixel_kde", "smc_transition", "particle_filter"]
+    elif args.pca_only:
+        raw_methods = ["none", "pixel_pca"]
+    else:
+        raw_methods = ["none", "pixel_kde", "reduced_kde"]
+        if args.pca:
+            raw_methods.append("pixel_pca")
+
     for st in step_list:
-        cases.append({
-            "name": f"ddim_{st}_baseline",
-            "sampler": "ddim",
-            "steps": st,
-            "mode": "none",
-            "k": 1,
-            "tau": 0.0,
-            "eta": 1.0,
-        })
-        if not args.pca_only:
+        if "none" in raw_methods:
+            cases.append({
+                "name": f"ddim_{st}_baseline",
+                "sampler": "ddim",
+                "steps": st,
+                "mode": "none",
+                "k": 1,
+                "tau": 0.0,
+                "eta": 1.0,
+            })
+        if "pixel_kde" in raw_methods:
             cases.append({
                 "name": f"ddim_{st}_bd_pixel_highdim",
                 "sampler": "ddim",
@@ -408,7 +441,27 @@ def main():
                 "tau": 0.01,
                 "eta": 1.0,
             })
-        if args.pca or args.pca_only:
+        if "smc_transition" in raw_methods:
+            cases.append({
+                "name": f"ddim_{st}_smc_transition",
+                "sampler": "ddim",
+                "steps": st,
+                "mode": "smc_transition",
+                "k": 2,
+                "tau": 0.01,
+                "eta": 1.0,
+            })
+        if "particle_filter" in raw_methods:
+            cases.append({
+                "name": f"ddim_{st}_particle_filter",
+                "sampler": "ddim",
+                "steps": st,
+                "mode": "particle_filter",
+                "k": 2,
+                "tau": 0.01,
+                "eta": 1.0,
+            })
+        if "pixel_pca" in raw_methods:
             cases.append({
                 "name": f"ddim_{st}_bd_pixel_pca_dim{args.kde_reduce}",
                 "sampler": "ddim",
@@ -418,7 +471,7 @@ def main():
                 "tau": 0.01,
                 "eta": 1.0,
             })
-        if not args.pca_only:
+        if "reduced_kde" in raw_methods:
             cases.append({
                 "name": f"ddim_{st}_bd_reduced_kde_dim{args.kde_reduce}",
                 "sampler": "ddim",
@@ -428,28 +481,6 @@ def main():
                 "tau": 0.01,
                 "eta": 1.0,
             })
-
-    if args.compare_all_paradigms:
-        cases.extend([
-            {
-                "name": "ddim_25_smc_transition",
-                "sampler": "ddim",
-                "steps": 25,
-                "mode": "smc_transition",
-                "k": 2,
-                "tau": 0.01,
-                "eta": 1.0,
-            },
-            {
-                "name": "ddim_25_particle_filter",
-                "sampler": "ddim",
-                "steps": 25,
-                "mode": "particle_filter",
-                "k": 2,
-                "tau": 0.01,
-                "eta": 1.0,
-            },
-        ])
 
     if args.include_ddpm:
         cases.append({
@@ -528,13 +559,12 @@ def main():
         plt.figure(figsize=(7.5, 4.8), dpi=150)
         curve_configs = [
             ("none", "Baseline DDIM (No BD)", "#1f77b4", "o-"),
+            ("pixel_kde", "High-Dim Pixel-KDE BD", "#d62728", "s--"),
+            ("smc_transition", "SMC Reverse Transition Weighting", "#ff7f0e", "v-"),
+            ("particle_filter", "Particle Filtering Solution Explorer", "#e377c2", "p-"),
             ("pixel_pca", f"Pixel-PCA BD (dim={args.kde_reduce})", "#9467bd", "D-"),
+            ("reduced_kde", f"Reduced-KDE BD (dim={args.kde_reduce})", "#2ca02c", "^-"),
         ]
-        if not getattr(args, "pca_only", False):
-            curve_configs.extend([
-                ("pixel_kde", "High-Dim Pixel-KDE BD", "#d62728", "s--"),
-                ("reduced_kde", f"Reduced-KDE BD (dim={args.kde_reduce})", "#2ca02c", "^-"),
-            ])
         for mode, label, color, style in curve_configs:
             pts = [r for r in results if r["bd_mode"] == mode and r.get("fid") is not None]
             if pts:
@@ -564,26 +594,32 @@ def main():
 
         # Plot 2: Unique Particle Fraction (Diversity)
         plt.figure(figsize=(7.5, 4.5), dpi=150)
-        if getattr(args, "pca_only", False):
-            modes = ["Baseline", f"Pixel-PCA (d={args.kde_reduce})"]
-            mode_keys = ("none", "pixel_pca")
-            colors = ["#1f77b4", "#9467bd"]
-        else:
-            modes = ["Baseline", "Pixel-KDE", f"Pixel-PCA (d={args.kde_reduce})", f"Reduced-KDE (d={args.kde_reduce})"]
-            mode_keys = ("none", "pixel_kde", "pixel_pca", "reduced_kde")
-            colors = ["#1f77b4", "#d62728", "#9467bd", "#2ca02c"]
-
+        palette = {
+            "none": ("Baseline", "#1f77b4"),
+            "pixel_kde": ("Pixel-KDE", "#d62728"),
+            "smc_transition": ("SMC-Transition", "#ff7f0e"),
+            "particle_filter": ("Particle-Filter", "#e377c2"),
+            "pixel_pca": (f"Pixel-PCA (d={args.kde_reduce})", "#9467bd"),
+            "reduced_kde": (f"Reduced-KDE (d={args.kde_reduce})", "#2ca02c"),
+        }
+        seen_modes = []
+        for r in results:
+            m = r["bd_mode"]
+            if m in palette and m not in seen_modes:
+                seen_modes.append(m)
+        modes = [palette[m][0] for m in seen_modes]
+        colors = [palette[m][1] for m in seen_modes]
         step_for_div = 25 if 25 in step_list else step_list[-1]
         uniques = []
-        for mode in mode_keys:
+        for m in seen_modes:
             matching = [
                 r["unique_fraction"]
                 for r in results
-                if r["bd_mode"] == mode and r["steps"] == step_for_div
+                if r["bd_mode"] == m and r["steps"] == step_for_div
             ]
             uniques.append(matching[0] if matching else 1.0)
 
-        plt.bar(modes, uniques, color=colors[:len(modes)], width=0.45)
+        plt.bar(modes, uniques, color=colors, width=0.45)
         plt.axhline(1.0, linestyle=":", color="gray", label="Ideal Diversity (1.0)")
         plt.ylabel("Unique Particle Fraction", fontsize=11)
         plt.title(
