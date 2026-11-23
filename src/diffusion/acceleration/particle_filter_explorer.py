@@ -164,6 +164,7 @@ class ParticleFilteringSolutionSpaceExplorer(SamplingModifier):
         candidates, potentials = self._explore_solution_branches(
             samples, timestep, prev_timestep, model, scheduler, generator=generator
         )
+        total_pool_size = candidates.shape[0]
 
         # 2. Candidate Selection preserving population diversity:
         # Each parent particle i selects its best exploratory candidate branch
