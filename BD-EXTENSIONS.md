@@ -1,173 +1,367 @@
-# Birth–Death extensions: code map, experiments, and current gaps
+# Birth–Death extensions: equations, code paths, and experiments
 
-This note describes the acceleration code currently in the repository and how to inspect or run it. The project presentation's slides 15 and 18 and the report's Sections 7–8 motivate the recent additions: high-dimensional KDE diagnostics, image-feature KDE, reverse-transition weighting, particle branching, and flow-based density evaluation.
+This document describes the acceleration methods currently implemented in `src/diffusion/acceleration/`, the equations they use, and the experiments available in the repository. The emphasis is on distinguishing genuine birth–death (BD) copy/replace updates from other resampling ideas that are grouped under acceleration.
 
-The new methods are experimental. Their class names describe the intended idea; a few of the current integrations are prototypes and should not yet be treated as faithful implementations of a complete algorithm or as evidence of image-sampling acceleration.
+The implementations are experimental. Equations below describe the code as it runs, and call out where the code is only a heuristic or approximation. In particular, using a BD update inside a reverse diffusion trajectory is a discrete splitting choice; the convergence results for stationary-target Langevin sampling in Lu, Lu, and Nolen do not by themselves prove acceleration or convergence for DDPM/DDIM.
 
-## 1. What is in `src/diffusion/acceleration/`
+## 1. Pipeline and shared notation
 
-| Implementation | What it uses to decide particle selection | Main difference | Current status |
+`SamplingPipeline` runs one reverse-sampler update and then calls each configured `SamplingModifier` on the resulting population. The modifier returns a population for the next reverse step. These modifiers run during sampling, not training. A population usually remains at its original size: a “birth” is implemented by copying one particle over another, and a “death” by replacing it with a peer, so the net count stays fixed.
+
+Notation used below:
+
+| Symbol | Meaning |
+|---|---|
+| `N` | Number of particles/images in the sampling population |
+| `M` | Number of reference examples used to estimate an empirical target |
+| `x_t[i]` | Particle `i` at diffusion noise level `t` |
+| `s < t` | Previous/less-noisy level after a reverse transition from `t` to `s` |
+| `bar_alpha_t` | Cumulative forward signal coefficient at level `t`, from the scheduler |
+| `d` | Number of scalar coordinates in a flattened sample or feature vector |
+| `h` | Gaussian KDE bandwidth |
+| `k` | Apply an intervention after every `k` completed sampler updates |
+| `tau`, `Delta_tau` | Artificial BD time and the increment assigned to one intervention |
+| `[a]_+` | `max(a, 0)` |
+| `B` | Number of proposed branches per parent in the particle explorer |
+| `T` | Temperature used to soften transition/branch scores |
+| `lambda` | Optional dispersion/diversity bonus coefficient |
+| `p_max` | Maximum allowed event probability per particle |
+| `T_train` | Number of scheduler training timesteps |
+| `s_0` | Standard deviation of the CNF's Gaussian base distribution |
+| `L` | Number of random vectors in the Hutchinson trace estimate |
+
+Indices `i`, `j`, and `r` refer to particles; `m` refers to a data reference; `b` refers to a branch. `I` is an identity matrix. The scheduler's `bar_alpha_t` is the product of its forward signal coefficients through step `t`.
+
+For the DDPM forward process, the code’s empirical target uses normalized noisy coordinates `z_t = x_t / sqrt(bar_alpha_t)`. In these coordinates, a clean reference `x_0^(m)` is blurred by Gaussian noise with
+
+$
+\sigma_t^2=\frac{1-\bar\alpha_t}{\bar\alpha_t},\qquad
+\pi_{M,t}(z)=\frac1M\sum_{m=1}^{M}
+\mathcal N\!\left(z;x_0^{(m)},\sigma_t^2 I\right).
+$
+
+`EmpiricalNoisedDataTarget.log_prob` evaluates this finite Gaussian-mixture density, including its Gaussian normalization. It is exact for the chosen `M` references, not for the full CIFAR-10/CelebA distribution. BD classes that use target coordinates convert `x_t` to/from `z_t` using $\sqrt{\bar\alpha_t}$.
+
+## 2. The common KDE birth–death update
+
+The original method and the reduced-feature and flow variants share the same population update. First estimate the current population density at each particle. In the original method the code uses the Gaussian KDE
+
+$
+\widehat q_h(x_i)=\frac1N\sum_{j=1}^{N}
+\exp\!\left(-\frac{\|x_i-x_j\|^2}{2h^2}\right).
+$
+
+The usual Gaussian KDE also has a factor $(2\pi h^2)^{-d/2}$. `BirthDeathAcceleration` omits that constant; it is the same for every particle and cancels when the rate is centered. The self term `j=i` is included.
+
+Given a target density $\pi(x_i)$, define
+
+$
+\delta_i=\log\widehat q_h(x_i)-\log\pi(x_i),\qquad
+\beta_i=\delta_i-\frac1N\sum_{r=1}^{N}\delta_r.
+$
+
+Here $\beta_i>0$ means particle (i) is overrepresented relative to the target compared with the population average; it is selected for death. If $\beta_i<0$, it is underrepresented and can give birth. For an intervention increment $\Delta\tau$, the code draws an event with probability
+
+$
+p_i=\min\!\left(p_{\max},1-\exp(-|\beta_i|\Delta\tau)\right).
+$
+
+The implementation evaluates the exponential stably as `-expm1(-abs(beta) * delta_tau)`. Equivalently, it draws `u_i ~ Uniform(0, 1)` and performs the event if `u_i < p_i`. It also draws a peer `j_i` uniformly from all particle positions except (i). When an event occurs:
+
+- If $\beta_i>0$, particle (i) is replaced by its selected peer (death of (i)).
+- If $\beta_i<0$, the peer is replaced by a copy of particle (i) (birth of (i)).
+
+The event decisions and peers are drawn from the pre-update rate vector, then applied in particle order. This copy/replace rule preserves `N`, but can create exact duplicates.
+
+In the current implementations, interventions are gated by cadence and timestep. The default minimum timestep is 100; optional maximum timestep can further restrict the interval. The scheduled raw pseudo-time is `total_time / floor(eligible_updates / k)` (where a clean terminal update is excluded), then the code applies $\Delta\tau=\min(\Delta\tau_{raw},\Delta\tau_{max})$. The default cap is 0.005 and the default event-probability cap is 0.25. Because the pseudo-time is capped, its sum across interventions can be less than `total_time`; timestep filtering can reduce the number of actual interventions further.
+
+## 3. Methods in `src/diffusion/acceleration/`
+
+### 3.1 `BirthDeathAcceleration`: target-density KDE BD
+
+This is the direct form of the common rule above. At each eligible post-sampler state it evaluates the population KDE and a caller-provided `target.log_prob`, centers their log-density difference, and copy/replaces particles according to $p_i$. The target can be analytic (for example, the toy Gaussian mixture) or an empirical finite-data target such as $\pi_{M,t}$ above.
+
+**What makes this BD:** the sign of the centered difference between population density and target density determines which particle is copied or killed. The target is evaluated at the destination noise level between reverse-sampler updates. This is an exploratory discrete extension to diffusion sampling, not a result established by the original stationary Langevin theorem.
+
+**Cost and limits:** the pairwise population KDE is approximately $O(N^2d)$ per intervention. The finite empirical target adds approximately $O(NMd)$ distance work. In image dimensions, the KDE can be dominated by the self-kernel and cease to provide useful neighborhood information.
+
+### 3.2 `ReducedKDEBirthDeathAcceleration`: feature-space KDE BD
+
+This keeps the same BD discrepancy and event rule, but first maps particles and empirical references through a feature map $\phi_t$:
+
+$
+z_i=\phi_t(x_i),\qquad r_m=\phi_t(x_0^{(m)}+\sigma_t\epsilon_m),\qquad
+\epsilon_m\sim\mathcal N(0,I),
+$
+
+when reference re-noising is enabled. The code then estimates two densities in feature space:
+
+$
+\widehat q_h^{feat}(z_i)=\frac1N\sum_j
+\exp\!\left(-\frac{\|z_i-z_j\|^2}{2h^2}\right),\qquad
+\widehat\pi_{M,h}^{feat}(z_i)=\frac1M\sum_m
+\exp\!\left(-\frac{\|z_i-r_m\|^2}{2h^2}\right),
+$
+
+and uses
+
+$
+\beta_i=\left[\log\widehat q_h^{feat}(z_i)-
+\log\widehat\pi_{M,h}^{feat}(z_i)\right]
+-\frac1N\sum_r\left[\log\widehat q_h^{feat}(z_r)-
+\log\widehat\pi_{M,h}^{feat}(z_r)\right].
+$
+
+The feature KDEs omit the common Gaussian kernel normalization, which cancels in the centered rate because both use the same feature dimension and bandwidth. The same positive-rate death / negative-rate birth rule follows.
+
+By default, $\phi_t$ is the time-conditioned DDPM-style encoder/bottleneck trunk, globally pooled to 64 or 128 values and then PCA-reduced (default 25). PCA centers by its fitted mean and divides projected coordinates by their fitted standard deviations. Other options include orthogonal projection, frozen random linear/MLP projection, direct pixel PCA, and passing small vectors through unchanged. The bandwidth `h` is therefore measured in the projected feature coordinates.
+
+This is **not** the original image density under a known invertible change of variables: the feature map is generally non-invertible and no Jacobian correction is applied. Thus $\widehat\pi_{M,h}^{feat}$ is a target proxy used to drive BD. For an analytic target without stored image references, the class instead calls `target.log_prob` on the target-coordinate particle samples.
+
+**Weight caveat:** a compatible local `SimpleUNet` can have its encoder weights copied into the trunk, and a compatible checkpoint can be provided. A Hugging Face U-Net is not automatically adapted. In common reduced-KDE benchmark paths the feature trunk starts randomly initialized, with PCA fitted on those random features. Therefore a reduced-KDE run is not automatically a test in pretrained semantic diffusion latents. With `--no-noise-references`, cached features are extracted from clean/timestep-zero references and compared with current-time particle features; this saves work but mismatches their noise levels.
+
+### 3.3 `SMCTransitionLikelihoodAcceleration`: transition-score BD-style resampling
+
+This method avoids both population KDE and a data target density. It caches the previous sampler state (x_t^{(i)}), then scores the new state (x_s^{(i)}) using the model's Gaussian reverse-transition formula. Let $\epsilon_\theta(x_t,t)$ be the predicted noise and
+
+$
+\widehat x_0=\frac{x_t-\sqrt{1-\bar\alpha_t}\,
+\epsilon_\theta(x_t,t)}{\sqrt{\bar\alpha_t}},
+$
+
+with the optional scheduler clipping applied to $\widehat x_0$. For previous level `s`, the code computes
+
+$
+\sigma_{t,s}^2=\frac{1-\bar\alpha_s}{1-\bar\alpha_t}
+\left(1-\frac{\bar\alpha_t}{\bar\alpha_s}\right),\qquad
+\mu_{t,s}=\sqrt{\bar\alpha_s}\,\widehat x_0+
+\sqrt{[1-\bar\alpha_s-\sigma_{t,s}^2]_+}\,
+\epsilon_\theta(x_t,t).
+$
+
+For adjacent steps, $\sigma_{t,s}^2$ is the DDPM posterior variance. For skipped steps, it is the DDIM variance at $\eta=1$. The implementation does not read the sampler's `eta`; arbitrary DDIM $\eta\ne1$ will therefore use a mismatched score.
+
+The relative transition log score for each particle `i` is
+
+$
+\ell_i=\frac1T\left[-\frac{\|x_s^{(i)}-\mu_{t,s}^{(i)}\|^2}
+{2\,\max(\sigma_{t,s}^2,10^{-12})}
++\lambda\|x_s^{(i)}-\bar x_s\|^2\right],\qquad
+\bar x_s=\frac1N\sum_i x_s^{(i)}.
+$
+
+Here `T` is `temperature`; $\lambda$ is the optional `divergence_penalty` (a batch-dispersion bonus, not a divergence calculation). The Gaussian log-normalization is omitted because it is common across particles and disappears after centering. The code defines
+
+$
+\beta_i=-\left(\ell_i-\frac1N\sum_r\ell_r\right).
+$
+
+Thus an unusually low transition score gives $\beta_i>0$ and makes the particle eligible for death; a high score makes it eligible for duplication. The common BD event formula, timestep/cadence gates, and caps then apply. This is a **BD-style heuristic over transition scores**, not complete SMC: it does not derive target-over-proposal incremental weights or include a correction for the desired endpoint distribution. It performs an extra denoiser call at interventions.
+
+### 3.4 `ParticleFilteringSolutionSpaceExplorer`: per-parent branching, then BD exchange
+
+This method has two distinct selection stages. First, for each parent (x_t^{(i)}), it predicts $\widehat x_0^{(i)}$, $\mu_{t,s}^{(i)}$, and $\sigma_{t,s}$ using the same $\eta=1$-style formulas above. It generates `B` candidates:
+
+$
+y_{i,b}=\mu_{t,s}^{(i)}+\sigma_{t,s}\epsilon_{i,b},
+\qquad \epsilon_{i,b}\sim\mathcal N(0,I),\quad b=1,\ldots,B.
+$
+
+The branch score is
+
+$
+V_{i,b}=-\frac{\|y_{i,b}-\mu_{t,s}^{(i)}\|^2}
+{2\,\max(\sigma_{t,s}^2,10^{-12})}
++\lambda\|y_{i,b}-\bar y\|^2,\qquad
+\bar y=\frac1{NB}\sum_{i,b}y_{i,b}.
+$
+
+The optional diversity coefficient $\lambda$ rewards distance from the mean of the entire `N × B`-candidate pool; a large value can favor outliers. For each parent independently, the code draws one branch from
+
+$
+P(b\mid i)=\frac{\exp(V_{i,b}/T)}
+{\sum_{c=1}^{B}\exp(V_{i,c}/T)},
+$
+
+where `T` is `temperature`. This leaves `N` selected candidates, one per original parent. This is different from a global softmax over all `N × B` candidates.
+
+Second, if `max_event_probability` is positive, the method applies a separate capped cross-particle BD exchange to the selected candidates. Let (V_i^*$ be the chosen branch score and $\bar V^*=N^{-1}\sum_iV_i^*$. The code sets
+
+$
+\beta_i=-(V_i^*-\bar V^*),\qquad
+p_i=\min\!\left(p_{\max},1-\exp(-|\beta_i|\cdot0.005)\right).
+$
+
+The fixed 0.005 is hard-coded; this modifier has no `total_time` parameter. Positive $\beta_i$ kills the low-score selected particle in favor of a peer; negative $\beta_i$ duplicates the higher-score particle over a peer. If the event cap is `None` or non-positive, this second BD stage is skipped, but branch generation and per-parent selection still run.
+
+This is a combination of proposal branching, within-parent selection, and a BD-like population exchange—not the original target-KDE BD rule. It uses neither a target log density nor a population KDE. Candidate count and temporary memory scale with `N × B`, and the model is evaluated to make candidates. **Alignment limitation:** the pipeline calls modifiers after the sampler step, so `state.samples` is already the destination `x_s`, while this explorer treats it as the source `x_t` and applies the `t -> s` transition again. The state/timestep pairing must be fixed before interpreting its output as a correctly aligned sampler transition.
+
+### 3.5 `FlowBirthDeathAcceleration` and `ContinuousNormalizingFlowTarget`
+
+`FlowBirthDeathAcceleration` uses the common BD rule with a population Gaussian KDE and a supplied target log density. Its code includes the full KDE normalization:
+
+$
+\log\widehat q_h(x_i)=\operatorname{LSE}_j\left(-\frac{\|x_i-x_j\|^2}{2h^2}\right)
+-\log N-\frac d2\log(2\pi h^2),
+\qquad
+\beta_i=\left(\log\widehat q_h(x_i)-\log p_t(x_i)\right)-\text{population mean}.
+$
+
+It then uses the common capped event probability and copy/replace rule. In principle, the supplied density could come from a continuous normalizing flow (CNF), which would make this a population-versus-flow-target BD update.
+
+For a CNF velocity field $v_\theta$ with ODE $dx_t/dt=v_\theta(x_t,t)$, the instantaneous change-of-variables identity is
+
+$
+\frac{d}{dt}\log p_t(x_t)=-\nabla\!\cdot v_\theta(x_t,t),
+\qquad
+\nabla\!\cdot v=\operatorname{tr}\!\left(\frac{\partial v}{\partial x}\right).
+$
+
+The density must integrate this divergence along the ODE path from a known base distribution. The exact sign of an integrated expression depends on whether the implementation parameterizes the forward or reverse time direction; the differential identity above uses the displayed forward ODE convention. The code's current `ContinuousNormalizingFlowTarget.log_prob` does **not** solve this ODE integral. It evaluates one endpoint divergence and uses the approximation
+
+$
+\log p_t(x)\;\mathrel{\text{(current code)}}=
+\log\mathcal N(x;0,s_0^2I)
+-(1-t')\,\nabla\!\cdot v_\theta(x,t'),
+\qquad t'=t/T_{train}.
+$
+
+This one-point approximation, including its sign under the intended time convention, needs validation before the density can be called exact. Exact divergence computes the Jacobian trace directly; for high-dimensional images this is prohibitively expensive. The Hutchinson option estimates it using
+
+$
+\operatorname{tr}(J_v)\approx\frac1L\sum_{l=1}^{L}
+e_l^\top J_v e_l,\qquad e_l\sim\mathcal N(0,I),
+$
+
+which reduces trace cost but remains a stochastic estimate. `SamplingPipeline.sample` is under `torch.no_grad()`, while this target needs autograd, so a gradient-enabled section is also needed for an end-to-end CNF run.
+
+**Current CLI caveat:** `sample_reduced_kde.py --acceleration-method flow_exact` and the `flow_exact` path in `run_reduced_kde_eval.py` do not construct `ContinuousNormalizingFlowTarget`; they pass the selected toy or empirical target to `FlowBirthDeathAcceleration`. The separate `scripts/run_exact_flow_eval.py` also does not instantiate a CNF: without FID references it uses an analytic standard-Gaussian target; with `--fid-samples > 0`, it uses `EmpiricalNoisedDataTarget` built from the evaluation images. These scripts exercise the flow-BD modifier with tractable targets, but they are not evidence of a trained or integrated CNF target. Flow BD also does not currently convert sampler state coordinates to the target's declared coordinates.
+
+## 4. At-a-glance differences
+
+| Method | Density/score used for selection | Is it BD? | Main extra work or limitation |
 |---|---|---|---|
-| `BirthDeathAcceleration` | Difference between KDE of the current population and a supplied target log density | Original fixed-population BD rule, using the sampler's state coordinates directly | Paper-style rate/resampling rule; image-space KDE is unreliable in high dimensions |
-| `ReducedKDEBirthDeathAcceleration` | The same population-versus-target KDE discrepancy after mapping images into a smaller feature vector | Replaces pixel distances with distances in a compressed feature space | Runnable experimental path; feature trunk is usually randomly initialized in the current image benchmark |
-| `SMCTransitionLikelihoodAcceleration` | Likelihood of the observed reverse transition under a Gaussian DDPM-style reverse kernel | Replaces pairwise KDE and target log density with a transition-likelihood score | Heuristic transition-based resampling; not a complete SMC weighting derivation and not matched to skipped-step DDIM |
-| `ParticleFilteringSolutionSpaceExplorer` | Scores a pool of sampled candidate reverse transitions, then retains N candidates | Branches each particle and resamples from an N×B candidate pool | Exploratory branch/filter method; current post-update state indexing needs correction before results are trusted |
-| `FlowBirthDeathAcceleration` and `ContinuousNormalizingFlowTarget` | Population KDE compared with a flow-based log-density | Supplies a tractable-density target through a velocity field | Prototype; the current flow density is not integrated exactly, is not wired as a flow target in the CLI, and needs gradients inside the sampling pipeline |
+| `BirthDeathAcceleration` | Full-coordinate population KDE versus supplied target $\log\pi_t$ | Yes; direct centered-rate copy/replace | `O(N^2 d)` KDE; high-dimensional self-kernel problem |
+| `ReducedKDEBirthDeathAcceleration` | Feature KDE versus feature-reference KDE (or analytic toy target) | Yes; same BD rule in projected space | Quality depends on feature map; current common trunk can be random |
+| `SMCTransitionLikelihoodAcceleration` | Gaussian reverse-transition residual score | BD-style copy/replace, but not complete SMC or target-corrected BD | Additional denoiser pass; score corresponds to $\eta=1$, not arbitrary DDIM $\eta$ |
+| `ParticleFilteringSolutionSpaceExplorer` | Branch-transition residual plus batch-dispersion bonus | Branch/filter stage plus a second BD-like exchange | `N × B` candidates; current source/destination alignment bug |
+| `FlowBirthDeathAcceleration` | Full-coordinate population KDE versus provided `log_prob` | Yes, if given a valid target density | CNF density prototype and CLI wiring are not exact/end-to-end |
 
-All are `SamplingModifier`s called by `SamplingPipeline` after a sampler update. BD and the resampling variants keep the population size fixed; the particle-filter method temporarily expands candidates and filters back to the original count. They run during generation, never during model training.
+None of these modifiers currently removes reverse-sampler steps by itself. They intervene between the configured steps and can add compute; a demonstrated speedup would require comparing wall-clock at matched quality/diversity or adding a justified adaptive stopping/step-skipping policy.
 
-### 1.1 Original pixel-space KDE BD
+## 5. How the methods map to the professor's comments
 
-`BirthDeathAcceleration` computes, for each particle, a Gaussian KDE over the other current particles and compares it with `target.log_prob`. It centers the resulting rate over the population. A positive centered rate marks a relatively overrepresented particle, which is replaced by a uniformly selected peer; a negative rate marks an underrepresented particle, which is copied over a peer. The event probability is `1 - exp(-abs(rate) * delta_tau)`.
+### KDE on image latents and why particles are retained or replaced
 
-For toy targets, `log_prob` can be analytic. For image experiments, `EmpiricalNoisedDataTarget` supplies the exact density of a finite Gaussian mixture centered on a selected data subset. This is exact for that finite mixture, not for the full CIFAR-10 or CelebA distribution. The pixel-space particle KDE costs roughly O(N²D) per intervention; empirical target evaluation adds roughly O(NMD), where N is the particle count, M the reference count, and D the flattened image dimension.
+The two KDE BD methods expose the needed mathematical decision rule: positive centered $\log\widehat q-\log\pi$ means overrepresentation and death; negative means underrepresentation and birth. `ReducedKDEBirthDeathAcceleration` computes this in a compressed feature vector, while `BirthDeathAcceleration` computes it in the target coordinates. `scripts/run_bd_unet_eval.py` is a newer non-toy route using a pretrained CIFAR-10 DDPM U-Net for transport with an empirical CIFAR-10 target, but it uses **pixel-space** BD, not pretrained image latents.
 
-This is the original rule documented in [DOCS-BD.md](DOCS-BD.md). Applying it between DDPM/DDIM updates is an exploratory time-dependent extension; the paper's fixed-target Langevin convergence result does not establish convergence or acceleration for that reverse process.
+Still missing for the latent-specific request: a reduced-KDE run with reliably loaded pretrained denoiser features, an image-feature KDE diagnostic, and a per-particle trace recording both density terms, $\beta_i$, event probability, random event decision, chosen peer, and resulting lineage.
 
-### 1.2 Reduced feature-space KDE
+### Diversity before and after each update
 
-`ReducedKDEBirthDeathAcceleration` passes both particles and target references through `FeatureReducer`, then computes the particle KDE and empirical-reference KDE in the reduced coordinates. The default feature path is a small DDPM-style encoder/bottleneck trunk (64 or 128 pooled features), followed by PCA to 25 dimensions. Orthogonal, frozen random linear, and frozen random MLP projections are also available. The reference images can be re-noised to the current timestep before feature extraction.
+Several non-toy benchmark scripts compute a final perceptual-uniqueness fraction; toy diagnostics report quality/diversity before and after a BD update. Modifier metadata includes event counts and selected scores. However, the pipeline does not preserve a full per-intervention history, and image scripts do not record per-step lineage or before/after diversity. These metrics cannot locate exactly when image repetition begins.
 
-The intended benefit is to make neighborhoods overlap in a compact representation, avoiding pixel-space self-kernel domination. The price is that the result depends on the representation and its scaling. For image targets, the target term is a KDE over transformed references; it is a feature-space density proxy, not the original pixel-space target density under a known invertible change of variables.
+### Matched quality/diversity and wall-clock including intervention cost
 
-There is an important implementation qualification: the trunk is not automatically loaded from the selected Hugging Face pretrained U-Net. It copies weights only from a compatible local `SimpleUNet` exposing matching encoder layers. The non-toy benchmark script builds a `target-score` model, which also does not provide those encoder layers. In those common paths the trunk starts with random weights; PCA is then fitted to features from that random trunk. Thus the code tests a compressed feature-space KDE, but it does not currently demonstrate KDE in pretrained semantic diffusion latents as the option names and script descriptions suggest.
+The benchmark runners compare baseline and modified sampling at selected step counts and report NFE, elapsed sampling time, diversity, and optionally MMD/FID. The timed call includes modifiers executed inside the sampling pipeline (including KDE and extra model calls). They do **not** automatically search for a lower-step BD run matching a higher-step baseline in both quality and diversity, or produce a complete quality/diversity versus wall-time frontier. Target/reference construction, PCA fitting before sampling, and separate FID generation/evaluation are outside the preview-sampling timer. FID references are generally drawn from the training view, not a held-out test split. Use multiple seeds and independent sampler/modifier RNGs for defensible comparisons.
 
-`--no-noise-references` caches features extracted at timestep 0 and compares them with current-timestep particle features. That avoids repeated reference feature extraction, but the feature distributions are then at different noise levels. Keep the default `--noise-references` for a state-matched experiment.
+## 6. Tests and experiment scripts
 
-### 1.3 Reverse-transition likelihood resampling
+### Unit and toy diagnostics
 
-`SMCTransitionLikelihoodAcceleration` caches the previous particle state. After a later sampler update, it evaluates the new state under a Gaussian reverse transition predicted from the cached parent. It centers these per-particle log likelihoods, converts them to event probabilities, and applies a fixed-population birth/death-style copy/replace rule. It uses no population pairwise KDE and no target log density. It performs an extra model forward call at interventions; the ordinary sampling hook counts these calls in NFE and sampling time.
-
-This is related to the presentation's proposed analytical reverse-kernel/SMC extension. The current weight is a transition-likelihood heuristic, not a full sequential importance weight with a target/proposal correction. Its variance formula is DDPM-style and does not use DDIM's `eta` or skipped-step transition variance. Use adjacent-step DDPM to inspect the current formula; treat DDIM runs as exploratory until the likelihood matches the actual DDIM proposal.
-
-### 1.4 Candidate branching and filtering
-
-`ParticleFilteringSolutionSpaceExplorer` draws B candidate transitions per particle, scores each using transition residual energy plus an optional distance-from-batch-mean bonus, forms a softmax, and selects N candidates without replacement. Its controls are `branch_factor`, `temperature`, `diversity_weight`, and intervention cadence. It uses neither the BD KDE discrepancy nor an explicit target log density. Candidate generation also costs memory and compute proportional to N×B, plus an extra model evaluation at an intervention.
-
-There is a state-indexing issue to fix before using its output as a sampler comparison. The pipeline invokes modifiers **after** the ordinary sampler step, so `state.samples` is already the destination state. The explorer currently treats that tensor as `x_t` and computes another reverse transition using the source timestep. It therefore branches from a post-update state with source-step labels, rather than branching the original parent state under the transition that just ran. The unit test checks pool size and output shape, not this trajectory alignment.
-
-### 1.5 Flow-density prototype
-
-`ContinuousNormalizingFlowTarget` accepts a velocity network and provides a Gaussian-prior log density with a divergence correction. `FlowBirthDeathAcceleration` then compares a population KDE with the supplied target density and applies the same general copy/replace mechanism.
-
-The implementation is not yet an exact CNF density calculation. A CNF log density needs the divergence integrated along the ODE trajectory. The current code evaluates divergence at the endpoint and multiplies it by the remaining time interval, a one-point approximation. Exact divergence loops over every output dimension and is impractical for image dimensions; Hutchinson estimation is available in the class but does not make the path exact. Also, `SamplingPipeline.sample` runs under `torch.no_grad()`, while CNF divergence and score evaluation need autograd; the flow target needs an explicit gradient-enabled section before it can run through the pipeline.
-
-The `sample_reduced_kde.py --acceleration-method flow_exact` branch does not construct `ContinuousNormalizingFlowTarget`. It passes the selected toy or empirical target to `FlowBirthDeathAcceleration`. That option currently runs a full-coordinate KDE against the selected target's log density; it is not a CNF experiment. The modifier also does not convert sampler states to the target's declared coordinates, so DDIM's raw `x_t` can be compared directly with a target defined in normalized `x_t/sqrt(alpha_bar_t)` coordinates. There is no flow training/configuration command or end-to-end flow sampling test in the repository yet.
-
-## 2. How the recent code maps to the professor's comments
-
-### Test KDE on image latents and explain retention/replacement
-
-**Partly addressed.** `ReducedKDEBirthDeathAcceleration` performs particle and reference KDEs in a compact feature space, and its update metadata contains births and deaths for an intervention. `tests/test_reduced_kde_birth_death.py` checks feature dimensions, projection/PCA behavior, and that one update returns metadata. `tests/bd_kde_dim_diagnostic.py` measures self-kernel mass, effective neighbors, KDE/target rank correlation, duplicates, MMD, and NLL across vector dimensions.
-
-**Still missing:** a trustworthy pretrained diffusion latent extractor in the common non-toy route, density/rate traces showing why particular particles were selected, and a high-dimensional KDE diagnostic directly on the image features used by the benchmark. The current high-dimensional diagnostic uses Gaussian vectors, not image latents.
-
-### Track diversity before and after each update
-
-**Partly addressed.** The non-toy benchmark scripts report a final unique-sample fraction. The Gaussian dimension diagnostic measures diversity before and after one BD update. BD modifiers put event counts in the returned `SamplingState.metadata`.
-
-**Still missing:** the pipeline discards each intermediate state's metadata and no image run logs unique lineages or image tiles after every intervention. The available final unique fraction cannot identify which update first caused repetition. `DOCS-BD.md` describes a manual toy trajectory observation, but it is not a reusable image-trajectory logger.
-
-### Compare DDPM/DDIM quality, diversity, and wall time including KDE
-
-**Partly addressed.** `scripts/run_deliverable4_eval.py` and `scripts/run_reduced_kde_eval.py` compare baseline and modified sampling at selected equal step counts, report FID and final unique fraction, and time the preview `SamplingPipeline.sample` call. That timer includes interventions executed inside the pipeline, including KDE/feature work and extra model calls.
-
-**Still missing:** these scripts do not automatically find a matched-quality or matched-diversity point, nor do they produce a quality/diversity-versus-wall-clock frontier. Their recorded time excludes target construction, PCA fitting performed when a modifier is created, and the separate FID-generation/evaluation pass. The FID reference examples are sampled from the same training dataset used to construct the empirical target, rather than a held-out split. The current comparison runners also pass the sampler generator as the modifier generator, so BD random draws consume the same random stream as sampler noise; the standalone `sample_reduced_kde.py` separates those streams.
-
-## 3. Existing testing and experiment tools
-
-| File | What it checks | Data regime |
+| File | What it checks | Data regime / limitation |
 |---|---|---|
-| `tests/test_novel_acceleration_methods.py` | Smoke/unit checks for transition likelihood, flow log-probability/score, one flow-BD update, and branch/filter population size | Small synthetic tensors; it does not run a full diffusion pipeline or validate statistical correctness |
-| `tests/test_reduced_kde_birth_death.py` | Encoder output shape/time-conditioning, projections/PCA, vector pass-through, one reduced-KDE update, CLI parsing | Synthetic vectors and random image tensors |
-| `tests/bd_kde_dim_diagnostic.py` | KDE self-mass, neighbor count, rank relationship, duplicates, MMD/NLL before/after one update | Known Gaussian vector targets across dimensions |
-| `tests/bd_paper_toy_diagnostic.py` | Fixed-target paper-inspired ULA/BD trajectories; bandwidth/seed sweeps and mode-responsibility TV, MSE, NLL, time | Known 2D four-component mixture |
-| `tests/bd_paper_equal_time.py` | Fixed-target ULA versus BD at equal step counts and longer ULA runs, reporting quality and wall time | Known 2D mixture |
-| `tests/bd_diffusion_sweep.py` | Matched-step DDIM/DDPM runs over step count, `eta`, bandwidth, pseudo-time, and seeds; NLL, MMD, mode coverage/TV, unique fraction, time | Analytic 2D toy mixture |
-| `tests/toy_bd_experiment.py`, `scripts/run_and_plot_toy.py` | Toy DDPM/DDIM/Langevin comparisons with and without original BD; metrics and sample plots | Analytic 2D toy mixture |
-| `scripts/run_deliverable4_eval.py` | Original pixel-space BD versus baseline over a step/budget/cadence/eta sweep; FID and final unique fraction | CIFAR-10 or ImageFolder |
-| `scripts/run_reduced_kde_eval.py` | Baseline, pixel KDE, reduced KDE; optional SMC-transition and particle-filter cases; FID, final unique fraction, NFE/time, CSV/JSON/plots | CIFAR-10 or ImageFolder; builds an empirical target-score model |
-| `sample_reduced_kde.py` | One run for one selected acceleration method; prints NFE/time/final unique fraction, saves sample output and optional JSON | Can select a pretrained/checkpoint model for SMC/PF, or an empirical target for reduced/flow branches |
+| `tests/test_novel_acceleration_methods.py` | Transition score, flow target score/log-prob, one flow-BD update, particle-filter output size | Synthetic tensors; no full image-pipeline validation |
+| `tests/test_reduced_kde_birth_death.py` | Feature sizes, projection/PCA, vector pass-through, one reduced-KDE update, CLI parsing | Synthetic vectors and random image tensors |
+| `tests/bd_kde_dim_diagnostic.py` | KDE self-mass, effective neighbors, KDE/target rank, duplicates, MMD/NLL around one BD update | Known Gaussian vector targets across dimensions |
+| `tests/bd_paper_toy_diagnostic.py` | Langevin/BD trajectories, bandwidth/seed sweeps, component TV/MSE/NLL/time | Known 2D mixture |
+| `tests/bd_paper_equal_time.py` | ULA versus BD at equal step counts and longer ULA runs | Known 2D mixture |
+| `tests/bd_diffusion_sweep.py` | DDPM/DDIM sweeps over steps, eta, bandwidth, BD pseudo-time and seeds; NLL/MMD/coverage/TV/uniqueness/time | Analytic 2D mixture |
+| `tests/toy_bd_experiment.py`, `scripts/run_and_plot_toy.py` | Toy DDPM/DDIM/Langevin comparisons and sample plots | Analytic 2D mixture |
 
-The tests are useful for shape and execution regressions. They do not establish that SMC weights are statistically correct, that the CNF density is exact, that particle-filter state indices match sampler transitions, or that a feature space is semantically meaningful. The test suite was not executed as part of this review.
+### Non-toy benchmark scripts
 
-The main experiment scripts can be run directly for toy diagnostics:
+| File | Purpose and caveat |
+|---|---|
+| `scripts/run_bd_unet_eval.py` | Baseline DDIM versus pretrained CIFAR DDPM transport plus pixel-space empirical KDE BD; CIFAR references, NFE/time, uniqueness, optional MMD/FID. Data path is hard-coded to `data/`; not the reduced-latent test. |
+| `scripts/run_reduced_kde_eval.py` | Step-grid benchmark for baseline, pixel KDE, reduced KDE, pixel PCA, and selectable SMC/PF/flow paths; saves metrics/plots. Its common model is `target-score`, not a trained image denoiser, so use it as a controlled plumbing/ablation runner. |
+| `scripts/run_deliverable4_eval.py` | Earlier pixel-space BD step/budget/cadence sweeps on CIFAR-10 or ImageFolder. |
+| `scripts/run_smc_eval.py` | Baseline DDIM versus transition-score resampling with a pretrained model by default; default step list 10/25/50 and FID disabled. Current cases use eta 1. |
+| `scripts/run_particle_filter_eval.py` | Baseline DDIM versus branching/filtering with a pretrained model by default; reports NFE/time, uniqueness and optional MMD/FID. Results remain exploratory due to state alignment. |
+| `scripts/run_exact_flow_eval.py` | Baseline versus FlowBD modifier with a pretrained transport model; target is Gaussian when FID is disabled and empirical-noised data when FID images are loaded. Despite the script label, it does not train or instantiate a CNF. |
+| `sample_reduced_kde.py` | One selectable method and sampler; writes NFE/time/uniqueness and optional JSON. Its `flow_exact` choice has the target caveat above. |
 
-```bash
-# Pixel-KDE self-domination as state dimension increases
-python3 tests/bd_kde_dim_diagnostic.py --dims 2,8,32,128,768 --counts 256,1024 --seeds 7,17,29 --total-times 0.1,1 --output samples/bd-kde-dim/metrics.json
+These tests mainly check shapes/execution and known toy targets. They do not prove that the transition heuristic is statistically correct, the CNF density is exact, the particle-filter state indices align, or learned features have semantic meaning. The test suite was not run as part of this documentation update.
 
-# Paper-inspired fixed-target Langevin mixing and bandwidth sweep
-python3 tests/bd_paper_toy_diagnostic.py --count 128 --steps 5000 --bandwidths 0.3,0.7,1.2 --output samples/bd-paper-toy-diagnostic/metrics.json
+## 7. Running experiments
 
-# Diffusion sampler sweep on the analytic 2D target
-python3 tests/bd_diffusion_sweep.py --counts 64 --steps 5,10 --etas 1 --bandwidths 0.7 --total-times 0.1 --seeds 7 --output samples/bd-diffusion-sweep/metrics.json
-```
-
-The first isolates the KDE estimator; the second tests the paper's stationary ULA setting; the third applies the project pipeline to DDIM/DDPM. They answer different questions and their scores should not be combined as though they were one benchmark.
-
-## 4. Running the non-toy experiments
-
-Install the project and, for FID, its optional dependencies:
+Install the package and optional FID dependencies if needed:
 
 ```bash
 python3 -m pip install -e .
-python3 -m pip install -e ".[fid]"
+python3 -m pip install -e "[fid]"
 ```
 
-Run the unit/smoke tests with:
+Run unit/smoke checks:
 
 ```bash
 python3 -m pytest tests/test_novel_acceleration_methods.py tests/test_reduced_kde_birth_death.py
 ```
 
-### Compare original pixel BD and reduced KDE on CIFAR-10
+Toy diagnostics:
 
-This runs the six default DDIM cases (25 and 50 steps; baseline, pixel KDE, reduced KDE), saves grids, and writes CSV/JSON/plots:
+```bash
+python3 tests/bd_kde_dim_diagnostic.py --dims 2,8,32,128,768 --counts 256,1024 --seeds 7,17,29 --total-times 0.1,1 --output samples/bd-kde-dim/metrics.json
+python3 tests/bd_paper_toy_diagnostic.py --count 128 --steps 5000 --bandwidths 0.3,0.7,1.2 --output samples/bd-paper-toy-diagnostic/metrics.json
+python3 tests/bd_diffusion_sweep.py --counts 64 --steps 5,10 --etas 1 --bandwidths 0.7 --total-times 0.1 --seeds 7 --output samples/bd-diffusion-sweep/metrics.json
+```
+
+For a pretrained CIFAR denoiser with empirical pixel-space BD:
+
+```bash
+python3 scripts/run_bd_unet_eval.py --steps 10 25 50 --batch-size 16 --reference-count 512 --bd-min-timestep 100 --bd-max-time 0.005 --bd-max-event-prob 0.25 --device cuda --output-dir samples/bd-unet-cifar
+```
+
+Add `--fid` to compute FID (the script uses up to `--fid-samples` real and generated examples). This script downloads/loads CIFAR-10 from its hard-coded `data/` location and uses the pretrained model selected by `--pretrained-model-id`.
+
+Dedicated pretrained-model comparisons for the other extensions:
+
+```bash
+python3 scripts/run_smc_eval.py --steps 10 25 50 --count 16 --fid-samples 0 --device cuda --output-dir samples/smc-cifar
+python3 scripts/run_particle_filter_eval.py --steps 10 25 50 --count 16 --fid-samples 0 --branch-factor 2 --device cuda --output-dir samples/pf-cifar
+```
+
+Set `--fid-samples` above zero to request FID/MMD reference loading. The transition script currently tests DDIM with eta 1, which matches its coded transition variance. Particle filtering remains a smoke/ablation only until its source/destination alignment is fixed.
+
+Reduced-KDE and method grid on CIFAR-10:
 
 ```bash
 python3 scripts/run_reduced_kde_eval.py --dataset cifar10 --data-dir data --download --image-size 32 --reference-count 256 --fid-samples 0 --count 16 --seed 42 --device cuda --output-dir samples/cifar-reduced-kde
 ```
 
-`--fid-samples 0` skips FID. To include the optional SMC-transition and particle-filter cases, add `--compare-all-paradigms`. To include 10-step cases, add `--include-steps-10`; `--include-ddpm` adds a 1000-step DDPM baseline. For a folder dataset, use `--dataset imagefolder --data-dir data/celeba --image-size 256`; the directory must have `ImageFolder` class subdirectories.
+Add `--compare-all-paradigms` for its SMC and particle-filter cases; add `--pca-only` for pixel PCA comparisons; use `--methods baseline pixel_kde reduced_kde` to choose explicit methods. For a folder dataset, use `--dataset imagefolder --data-dir data/celeba --image-size 256` and ensure the directory has `ImageFolder` class subdirectories. The reduced-KDE benchmark constructs a `target-score` model from an empirical subset rather than loading a pretrained image denoiser.
 
-This benchmark currently uses `target-score` built from the selected empirical subset, not a pretrained CIFAR/CelebA diffusion model. Its reduced features therefore use the randomly initialized encoder caveat above. Its FID reference images also come from that dataset's training view. Treat it as a plumbing/ablation runner, not a held-out learned-model benchmark. Set `--fid-samples` to a positive count to compute FID; this requires the optional FID dependencies and can dominate runtime.
-
-### Run one method with the standalone sampler
-
-For reduced KDE against a non-toy empirical target:
+The separate flow-BD benchmark is runnable as:
 
 ```bash
-python3 sample_reduced_kde.py --empirical-data-target --target-dataset cifar10 --target-data-dir data --target-download --target-image-size 32 --target-reference-count 256 --sampler ddim --steps 25 --eta 1 --birth-death --acceleration-method reduced_kde --kde-reduce 25 --bd-every-k 2 --bd-total-time 0.01 --count 16 --seed 7 --device cuda --output samples/cifar-reduced-kde-one.png --metrics-output samples/cifar-reduced-kde-one.json
+python3 scripts/run_exact_flow_eval.py --steps 10 25 --count 16 --fid-samples 0 --device cuda --output-dir samples/flow-bd-cifar
 ```
 
-This also uses the empirical target-score model rather than a separately loaded learned model. `sample_reduced_kde.py` currently accepts `--fid`/FID options but does not evaluate FID; use `scripts/run_reduced_kde_eval.py` for FID. The standalone script only writes JSON when `--metrics-output` is provided.
+With FID disabled, its target is a standard Gaussian. With FID enabled, it constructs an empirical noisy-data target from the images loaded for evaluation and also performs FID work. Neither path is a CNF experiment; see Section 3.5.
 
-For transition-likelihood resampling with a pretrained CIFAR model, the current likelihood is DDPM-style, so use adjacent-step DDPM for a formula-aligned smoke run:
-
-```bash
-python3 sample_reduced_kde.py --pretrained-model-id google/ddpm-cifar10-32 --sampler ddpm --birth-death --acceleration-method smc_transition --bd-every-k 2 --bd-total-time 0.01 --count 16 --seed 7 --device cuda --output samples/cifar-smc-transition.png --metrics-output samples/cifar-smc-transition.json
-```
-
-This uses all scheduler timesteps and can be slow. A reduced-step DDIM run is possible from the CLI, but its transition likelihood must first be changed to match the chosen DDIM `eta` and skipped-step proposal before its quality result is interpreted as an SMC comparison.
-
-The `particle_filter` option is executable through `sample_reduced_kde.py` with `--acceleration-method particle_filter --filter-branch-factor 2`. Keep it to a smoke run until the parent-state/timestep alignment described above is corrected. `flow_exact` is also selectable, but it does not instantiate a CNF target; do not treat that flag as a CNF experiment.
-
-### Run the original Deliverable 4 sweep
-
-For the older pixel-space BD baseline, `scripts/run_deliverable4_eval.py` accepts the same CIFAR/ImageFolder data options and runs a larger fixed grid. `--quick` reduces the grid. Set `--fid-samples 0` to skip FID; otherwise its default is 500 images and requires the FID extra. Outputs go to `deliverable4_results/` by default. This runner compares fixed step counts and records final diversity, not diversity after every intervention.
+The original pixel-BD sweep remains available:
 
 ```bash
 python3 scripts/run_deliverable4_eval.py --dataset cifar10 --data-dir data --download --reference-count 256 --fid-samples 0 --count 16 --seed 42 --device cuda --quick --output-dir samples/deliverable4-cifar
 ```
 
-## 5. What remains to make these results defensible
+## 8. Important next steps
 
-1. Load a real trained/pretrained denoiser's encoder for reduced-KDE, or provide and train a clearly specified image encoder. Allow the model and the empirical reference dataset to be selected independently so the learned sampler and target references can be evaluated together.
-2. Add a per-intervention trace: particle IDs/lineages, unique float and saved-image counts before/after, KDE self-mass or neighbor statistics, `log KDE`, target/transition score, centered rate, event probability, births/deaths, timestep, and wall time. Preserve these records outside `SamplingState.metadata` across the whole pipeline.
-3. Make SMC use the actual sampler proposal, including DDIM `eta` and skipped timesteps, and derive/validate target-over-proposal incremental weights. Clarify whether the desired method is SMC resampling or the paper's centered BD process.
-4. Correct the particle-filter parent-state alignment and report the N×B candidate cost, added model evaluations, and diversity at each filtering event.
-5. Implement a trained CNF/flow target with numerical ODE integration of divergence, gradient-enabled evaluation within the sampler, and an end-to-end sampling CLI/test against a target with known density.
-6. Use a held-out reference split, independent random streams for sampler and modifier, multiple seeds, and quality/diversity-versus-wall-clock curves. Report both preview and FID sample counts. The current scripts compare selected step budgets but do not solve the matched-quality/diversity operating point automatically.
+1. Provide a reliable pretrained-denoiser feature extractor/checkpoint for reduced KDE, and diagnose KDE overlap on those actual image features.
+2. Add a trajectory logger for per-update lineages, before/after diversity, KDE/target or transition scores, centered rates, event probabilities, peers, births/deaths, timestep, and wall time.
+3. Derive transition resampling weights from the actual target/proposal relationship and ensure they match sampler type, DDIM eta, and skipped timesteps.
+4. Fix particle-filter parent-state/timestep alignment; measure its `N × B` candidate overhead and diversity at each filtering event.
+5. Implement a trained CNF target with numerical ODE integration of divergence, a validated time convention, gradient-enabled evaluation inside sampling, and an end-to-end known-density test.
+6. Use held-out reference data, independent RNG streams, multiple seeds, and quality/diversity-versus-wall-clock curves. Include reference/PCA setup and FID work when reporting end-to-end costs.
 
-For the broad project findings and previous results, see [FINDINGS.md](FINDINGS.md). For the original BD equations and assumptions, see [DOCS-BD.md](DOCS-BD.md). The presentation's proposed SMC and flow directions are on slide 18; the report's high-dimensional diagnostics and image results are in Sections 7–8 of `IE643_Project_Report.pdf`.
+For the original BD equations and assumptions, see [DOCS-BD.md](DOCS-BD.md). For earlier project findings, see [FINDINGS.md](FINDINGS.md).
