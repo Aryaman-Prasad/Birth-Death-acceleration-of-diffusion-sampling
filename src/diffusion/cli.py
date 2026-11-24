@@ -380,8 +380,12 @@ def sample_main(argv=None):
                         help="apply birth-death after every k sampler updates (default: 1)")
     parser.add_argument("--bd-total-time", type=float, default=1.0,
                         help="total birth-death pseudo-time budget divided over scheduled interventions")
+    parser.add_argument("--bd-max-time", type=float, default=0.005,
+                        help="maximum pseudo-time step delta_tau per BD intervention (default: 0.005)")
     parser.add_argument("--bd-min-timestep", type=int, default=100,
                         help="minimum diffusion timestep to allow BD interventions (default: 100)")
+    parser.add_argument("--bd-max-timestep", type=int, default=None,
+                        help="maximum diffusion timestep to allow BD interventions (default: None)")
     parser.add_argument("--bd-max-event-prob", type=float, default=0.25,
                         help="maximum probability cap for any single BD birth/death event (default: 0.25)")
     parser.add_argument("--toy-mixture-radius", type=float, default=2.0)
@@ -532,6 +536,8 @@ def sample_main(argv=None):
             every_k_steps=args.bd_every_k,
             total_time=args.bd_total_time,
             min_timestep=args.bd_min_timestep,
+            max_timestep=args.bd_max_timestep,
+            max_delta_tau=args.bd_max_time,
             max_event_probability=args.bd_max_event_prob,
         ))
     pipeline = SamplingPipeline(sampler, scheduler, modifiers=modifiers)

@@ -168,7 +168,9 @@ def run_bd_unet_case(
     kernel_bandwidth=0.3,
     every_k=1,
     total_time=1.0,
+    max_delta_tau=0.005,
     min_timestep=100,
+    max_timestep=None,
     max_event_prob=0.25,
     real_images=None,
     fid_batch_size=64,
@@ -181,6 +183,8 @@ def run_bd_unet_case(
         every_k_steps=every_k,
         total_time=total_time,
         min_timestep=min_timestep,
+        max_timestep=max_timestep,
+        max_delta_tau=max_delta_tau,
         max_event_probability=max_event_prob,
     )
     pipeline = SamplingPipeline(sampler, scheduler, modifiers=[bd_modifier])
@@ -271,6 +275,18 @@ def main():
         type=int,
         default=100,
         help="Minimum timestep for BD (set to 0 for unrestricted BD)",
+    )
+    parser.add_argument(
+        "--bd-max-timestep",
+        type=int,
+        default=None,
+        help="Maximum timestep for BD interventions (default: None)",
+    )
+    parser.add_argument(
+        "--bd-max-time",
+        type=float,
+        default=0.005,
+        help="Maximum pseudo-time step delta_tau per BD intervention (default: 0.005)",
     )
     parser.add_argument(
         "--bd-max-event-prob",
@@ -383,7 +399,9 @@ def main():
             kernel_bandwidth=args.bd_kernel_bandwidth,
             every_k=args.bd_every_k,
             total_time=args.bd_total_time,
+            max_delta_tau=args.bd_max_time,
             min_timestep=args.bd_min_timestep,
+            max_timestep=args.bd_max_timestep,
             max_event_prob=args.bd_max_event_prob,
             real_images=real_images if args.fid else None,
             fid_batch_size=args.fid_batch_size,
