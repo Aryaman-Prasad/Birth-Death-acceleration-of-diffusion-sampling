@@ -333,6 +333,8 @@ def sample_main(argv=None):
                         help="use the exact score model for the analytic 2D Gaussian-mixture target")
     source.add_argument("--empirical-data-target", action="store_true",
                         help="use the exact score/log density of a Gaussian-smoothed subset of a dataset")
+    source.add_argument("--bd-unet", action="store_true",
+                        help="sample with pretrained U-Net while applying empirical KDE Birth-Death particle updates")
     parser.add_argument("--target-dataset", default="toy-mixture",
                         help="dataset used by --empirical-data-target: cifar10, imagefolder, toy-images, or toy-mixture")
     parser.add_argument("--target-data-dir", default="data",
@@ -378,6 +380,10 @@ def sample_main(argv=None):
                         help="apply birth-death after every k sampler updates (default: 1)")
     parser.add_argument("--bd-total-time", type=float, default=1.0,
                         help="total birth-death pseudo-time budget divided over scheduled interventions")
+    parser.add_argument("--bd-min-timestep", type=int, default=100,
+                        help="minimum diffusion timestep to allow BD interventions (default: 100)")
+    parser.add_argument("--bd-max-event-prob", type=float, default=0.25,
+                        help="maximum probability cap for any single BD birth/death event (default: 0.25)")
     parser.add_argument("--toy-mixture-radius", type=float, default=2.0)
     parser.add_argument("--toy-mixture-standard-deviation", type=float, default=0.15)
     parser.add_argument("--count", type=int, default=16)
@@ -451,6 +457,37 @@ def sample_main(argv=None):
         )
         model = make_model("target-score", target=target, scheduler=scheduler).to(device)
         sample_shape = tuple(data_module.sample_shape)
+    elif args.bd_unet:
+        model_id = args.pretrained_model_id or DEFAULT_PRETRAINED_MODEL
+        model = make_model("huggingface-unet", pretrained_model_id=model_id,
+                           revision=args.pretrained_revision,
+                           subfolder=args.pretrained_unet_subfolder).to(device)
+        scheduler_name = "huggingface" if args.scheduler == "auto" else args.scheduler
+        scheduler = make_scheduler(scheduler_name, args.timesteps, args.beta_start, args.beta_end,
+                                   model_id, args.pretrained_revision,
+                                   args.pretrained_scheduler_subfolder).to(device)
+        sample_shape = tuple(model.sample_shape)
+        target_dataset = args.target_dataset if args.target_dataset != "toy-mixture" else "cifar10"
+        download = args.target_download or (target_dataset == "cifar10")
+        try:
+            data_module = make_data_module(
+                target_dataset, args.target_data_dir, args.target_image_size,
+                download, args.target_toy_size, args.target_reference_seed,
+            )
+            reference_dataset = data_module.dataset()
+        except RuntimeError:
+            data_module = make_data_module(
+                target_dataset, args.target_data_dir, args.target_image_size,
+                True, args.target_toy_size, args.target_reference_seed,
+            )
+            reference_dataset = data_module.dataset()
+        ref_count = min(args.target_reference_count, len(reference_dataset))
+        target = EmpiricalNoisedDataTarget.from_dataset(
+            reference_dataset,
+            num_reference_samples=ref_count,
+            seed=args.target_reference_seed,
+            reference_chunk_size=args.target_reference_chunk_size,
+        )
     else:
         model_id = args.pretrained_model_id or DEFAULT_PRETRAINED_MODEL
         model = make_model("huggingface-unet", pretrained_model_id=model_id,
@@ -471,10 +508,10 @@ def sample_main(argv=None):
         langevin_initial_scale=args.langevin_initial_scale,
     )
     modifiers = []
-    if args.birth_death:
-        if target is None or not (args.toy_mixture_oracle or args.empirical_data_target):
+    if args.birth_death or args.bd_unet:
+        if target is None or not (args.toy_mixture_oracle or args.empirical_data_target or args.bd_unet):
             raise ValueError(
-                "--birth-death requires --toy-mixture-oracle or --empirical-data-target with a known target density"
+                "--birth-death requires --toy-mixture-oracle, --empirical-data-target, or --bd-unet with a known target density"
             )
         if args.sampler not in {"ddpm", "ddim", "langevin", "ula"}:
             raise ValueError(
@@ -494,6 +531,8 @@ def sample_main(argv=None):
             args.bd_kernel_bandwidth,
             every_k_steps=args.bd_every_k,
             total_time=args.bd_total_time,
+            min_timestep=args.bd_min_timestep,
+            max_event_probability=args.bd_max_event_prob,
         ))
     pipeline = SamplingPipeline(sampler, scheduler, modifiers=modifiers)
     generator = torch.Generator(device=device).manual_seed(args.seed) if args.seed is not None else None
