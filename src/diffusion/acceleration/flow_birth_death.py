@@ -154,6 +154,7 @@ class FlowBirthDeathAcceleration(SamplingModifier):
         max_timestep: int | None = None,
         max_delta_tau: float = 0.005,
         max_event_probability: float = 0.25,
+        add_noise: float = 0.0,
     ):
         if every_k_steps < 1:
             raise ValueError("every_k_steps must be positive")
@@ -170,6 +171,7 @@ class FlowBirthDeathAcceleration(SamplingModifier):
         self.max_event_probability = (
             float(max_event_probability) if max_event_probability is not None else None
         )
+        self.add_noise = float(add_noise)
 
     def apply(
         self, state: SamplingState, *, model, scheduler, generator
@@ -240,6 +242,7 @@ class FlowBirthDeathAcceleration(SamplingModifier):
         ).cpu().tolist()
 
         source_indices = list(range(population))
+        cloned_positions = []
         births = 0
         deaths = 0
         for index, (is_selected, is_overrepresented, raw_partner) in enumerate(
@@ -253,15 +256,37 @@ class FlowBirthDeathAcceleration(SamplingModifier):
             if is_overrepresented:
                 # Overrepresented compared to exact flow density -> kill & replace
                 source_indices[index] = source_indices[partner]
+                cloned_positions.append(index)
                 deaths += 1
             else:
                 # Underrepresented compared to exact flow density -> duplicate
                 source_indices[partner] = source_indices[index]
+                cloned_positions.append(partner)
                 births += 1
 
         updated = samples.index_select(
             0, torch.tensor(source_indices, device=samples.device, dtype=torch.long)
         )
+        if self.add_noise > 0 and cloned_positions:
+            unique_cloned = sorted(list(set(cloned_positions)))
+            noise = torch.randn(
+                (len(unique_cloned), *samples.shape[1:]),
+                device=samples.device,
+                dtype=samples.dtype,
+                generator=generator,
+            )
+            scale = self.add_noise
+            if (
+                timestep is not None
+                and hasattr(scheduler, "alpha_bars")
+                and int(timestep) < len(scheduler.alpha_bars)
+            ):
+                alpha_bar = scheduler.alpha_bars[int(timestep)].to(samples)
+                sigma_t = (1.0 - alpha_bar).clamp_min(1e-12).sqrt()
+                scale = self.add_noise * sigma_t
+            cloned_tensor_idx = torch.tensor(unique_cloned, device=samples.device, dtype=torch.long)
+            updated = updated.clone()
+            updated[cloned_tensor_idx] = updated[cloned_tensor_idx] + scale * noise
 
         metadata = dict(state.metadata)
         metadata.update(

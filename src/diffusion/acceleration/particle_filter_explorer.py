@@ -43,6 +43,7 @@ class ParticleFilteringSolutionSpaceExplorer(SamplingModifier):
         min_timestep: int | None = 100,
         max_timestep: int | None = None,
         max_event_probability: float = 0.25,
+        add_noise: float = 0.0,
     ):
         if branch_factor < 2:
             raise ValueError("branch_factor must be at least 2 to explore alternative paths")
@@ -60,6 +61,7 @@ class ParticleFilteringSolutionSpaceExplorer(SamplingModifier):
         self.max_event_probability = (
             float(max_event_probability) if max_event_probability is not None else None
         )
+        self.add_noise = float(add_noise)
 
     def _explore_solution_branches(
         self,
@@ -203,6 +205,7 @@ class ParticleFilteringSolutionSpaceExplorer(SamplingModifier):
             ).cpu().tolist()
 
             source_indices = list(range(N))
+            cloned_positions = []
             for idx, (is_sel, is_over, raw_partner) in enumerate(event_data):
                 if not is_sel:
                     continue
@@ -211,12 +214,36 @@ class ParticleFilteringSolutionSpaceExplorer(SamplingModifier):
                     partner += 1
                 if is_over:
                     source_indices[idx] = source_indices[partner]
+                    cloned_positions.append(idx)
                 else:
                     source_indices[partner] = source_indices[idx]
+                    cloned_positions.append(partner)
 
             filtered_samples = surviving_samples.index_select(
                 0, torch.tensor(source_indices, device=samples.device, dtype=torch.long)
             )
+            if self.add_noise > 0 and cloned_positions:
+                unique_cloned = sorted(list(set(cloned_positions)))
+                noise = torch.randn(
+                    (len(unique_cloned), *samples.shape[1:]),
+                    device=samples.device,
+                    dtype=samples.dtype,
+                    generator=generator,
+                )
+                scale = self.add_noise
+                if (
+                    timestep is not None
+                    and hasattr(scheduler, "alpha_bars")
+                    and int(timestep) < len(scheduler.alpha_bars)
+                ):
+                    alpha_bar = scheduler.alpha_bars[int(timestep)].to(samples)
+                    sigma_t = (1.0 - alpha_bar).clamp_min(1e-12).sqrt()
+                    scale = self.add_noise * sigma_t
+                cloned_tensor_idx = torch.tensor(unique_cloned, device=samples.device, dtype=torch.long)
+                filtered_samples = filtered_samples.clone()
+                filtered_samples[cloned_tensor_idx] = (
+                    filtered_samples[cloned_tensor_idx] + scale * noise
+                )
         else:
             filtered_samples = surviving_samples
 

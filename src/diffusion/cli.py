@@ -388,6 +388,14 @@ def sample_main(argv=None):
                         help="maximum diffusion timestep to allow BD interventions (default: None)")
     parser.add_argument("--bd-max-event-prob", type=float, default=0.25,
                         help="maximum probability cap for any single BD birth/death event (default: 0.25)")
+    parser.add_argument(
+        "--add-noise",
+        nargs="?",
+        const=0.05,
+        default=0.0,
+        type=float,
+        help="add perturbation noise to cloned particles after BD to promote output diversity (default: 0.05 when flag is present)",
+    )
     parser.add_argument("--toy-mixture-radius", type=float, default=2.0)
     parser.add_argument("--toy-mixture-standard-deviation", type=float, default=0.15)
     parser.add_argument("--count", type=int, default=16)
@@ -539,6 +547,7 @@ def sample_main(argv=None):
             max_timestep=args.bd_max_timestep,
             max_delta_tau=args.bd_max_time,
             max_event_probability=args.bd_max_event_prob,
+            add_noise=args.add_noise,
         ))
     pipeline = SamplingPipeline(sampler, scheduler, modifiers=modifiers)
     generator = torch.Generator(device=device).manual_seed(args.seed) if args.seed is not None else None
