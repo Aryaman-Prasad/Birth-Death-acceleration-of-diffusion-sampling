@@ -21,7 +21,13 @@ import sys
 import time
 
 import torch
+from torchvision import datasets as tv_datasets
 from torchvision.utils import save_image
+
+# Fast CDN mirror to bypass slow cs.toronto.edu server throttling (~60 kB/s -> ~50 MB/s)
+tv_datasets.CIFAR10.url = (
+    "https://github.com/Digital-Media/cv_data/releases/download/cifar-10/cifar-10-python.tar.gz"
+)
 
 # Project root
 PROJECT_ROOT = Path(__file__).resolve().parents[1]

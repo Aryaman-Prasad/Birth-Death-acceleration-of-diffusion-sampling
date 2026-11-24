@@ -4,6 +4,11 @@ from pathlib import Path
 
 from torchvision import datasets, transforms
 
+# Fast CDN mirror to bypass slow cs.toronto.edu server throttling (~60 kB/s -> ~50 MB/s)
+datasets.CIFAR10.url = (
+    "https://github.com/Digital-Media/cv_data/releases/download/cifar-10/cifar-10-python.tar.gz"
+)
+
 from diffusion.datasets.base import DiffusionDataModule
 
 
