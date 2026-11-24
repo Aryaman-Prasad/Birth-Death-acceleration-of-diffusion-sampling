@@ -21,7 +21,13 @@ import sys
 import time
 
 import torch
+from torchvision import datasets as tv_datasets
 from torchvision.utils import save_image
+
+# Fast CDN mirror to bypass slow cs.toronto.edu server throttling (~60 kB/s -> ~50 MB/s)
+tv_datasets.CIFAR10.url = (
+    "https://github.com/Digital-Media/cv_data/releases/download/cifar-10/cifar-10-python.tar.gz"
+)
 
 # Project root
 PROJECT_ROOT = Path(__file__).resolve().parents[1]
@@ -172,6 +178,7 @@ def run_bd_unet_case(
     min_timestep=100,
     max_timestep=None,
     max_event_prob=0.25,
+    add_noise=0.0,
     real_images=None,
     fid_batch_size=64,
 ):
@@ -186,6 +193,7 @@ def run_bd_unet_case(
         max_timestep=max_timestep,
         max_delta_tau=max_delta_tau,
         max_event_probability=max_event_prob,
+        add_noise=add_noise,
     )
     pipeline = SamplingPipeline(sampler, scheduler, modifiers=[bd_modifier])
 
@@ -297,6 +305,14 @@ def main():
     parser.add_argument("--bd-total-time", type=float, default=1.0)
     parser.add_argument("--bd-kernel-bandwidth", type=float, default=0.3)
     parser.add_argument("--bd-every-k", type=int, default=1)
+    parser.add_argument(
+        "--add-noise",
+        nargs="?",
+        const=0.05,
+        default=0.0,
+        type=float,
+        help="Add perturbation noise to cloned particles after BD to increase diversity (default: 0.05 when set)",
+    )
     parser.add_argument("--eta", type=float, default=0.0, help="DDIM stochasticity")
     parser.add_argument("--seed", type=int, default=42)
     parser.add_argument("--device", default="auto")
@@ -403,6 +419,7 @@ def main():
             min_timestep=args.bd_min_timestep,
             max_timestep=args.bd_max_timestep,
             max_event_prob=args.bd_max_event_prob,
+            add_noise=args.add_noise,
             real_images=real_images if args.fid else None,
             fid_batch_size=args.fid_batch_size,
         )
