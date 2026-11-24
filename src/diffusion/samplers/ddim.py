@@ -13,6 +13,10 @@ class DDIMSampler(Sampler):
             raise ValueError("eta must be non-negative")
         self.eta = eta
 
+    def sampling_metadata(self, timestep: int, previous_timestep: int,
+                          scheduler: NoiseScheduler) -> dict:
+        return {"sampler_name": "ddim", "eta": self.eta}
+
     def inference_timesteps(self, scheduler: NoiseScheduler, num_inference_steps: int | None,
                             device: torch.device) -> torch.Tensor:
         count = scheduler.num_train_timesteps if num_inference_steps is None else num_inference_steps

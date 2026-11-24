@@ -49,11 +49,13 @@ class SamplingPipeline:
         ]
 
         for timestep, previous, context in steps:
+            source_samples = samples
             samples = self.sampler.step(model, samples, timestep, previous, self.scheduler, generator)
             state = SamplingState(
                 samples, timestep, previous,
                 self.sampler.sampling_metadata(timestep, previous, self.scheduler),
                 context=context,
+                source_samples=source_samples,
             )
             for modifier in self.modifiers:
                 state = modifier.apply(

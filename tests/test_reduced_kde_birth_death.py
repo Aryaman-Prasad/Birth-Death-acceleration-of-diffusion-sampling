@@ -113,6 +113,7 @@ def test_reduced_kde_birth_death_step():
         every_k_steps=1,
         total_time=1.0,
         backbone="bottleneck",
+        min_timestep=0,
     )
 
     particles = torch.randn(16, 3, 32, 32)

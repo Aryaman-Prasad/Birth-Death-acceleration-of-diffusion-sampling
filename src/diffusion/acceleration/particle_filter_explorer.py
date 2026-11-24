@@ -1,36 +1,23 @@
-"""Particle Filtering Solution Space Explorer with Combined Birth-Death Resampling.
-
-Implements an exploratory particle filtering strategy for diffusion reverse sampling:
-1. Branching (Solution Space Exploration):
-   Instead of following a single stochastic trajectory, each particle x_t branches into
-   B candidate transitions exploring local stochastic variations:
-       x_{t-1}^{(i, b)} = mu_theta(x_t^{(i)}, t) + sigma_t * epsilon^{(i, b)},  b in {1, ..., B}
-2. Solution Quality Potential:
-   Evaluates each branched candidate using a reconstruction consistency / potential score:
-       G_t(x_{t-1}) = -||x_{t-1} - mu_theta(x_t, t)||^2 / (2 * sigma_t^2)
-3. Combined Birth-Death Resampling:
-   Combines Sequential Monte Carlo filtering with Birth-Death interaction to prune
-   the expanded N * B candidate pool back to N elite particles, actively weeding
-   out degenerate exploratory branches while duplicating high-fidelity modes.
-"""
-
-import math
-from typing import Any
+"""Exploratory branching and resampling around stochastic DDPM/DDIM steps."""
 
 import torch
-from torch import nn
 
-from diffusion.acceleration.base import SamplingModifier, SamplingState
-from diffusion.sampling import SamplingContext
+from diffusion.acceleration.base import (
+    SamplingModifier,
+    SamplingState,
+    coordinate_noise_std,
+)
+from diffusion.acceleration.reverse_transition import reverse_transition_parameters
 
 
 class ParticleFilteringSolutionSpaceExplorer(SamplingModifier):
-    """Explores solution space during reverse diffusion via branching and particle filtering.
+    """Branch from each pre-step parent, then select one candidate per parent.
 
-    At each intervention cadence:
-    1. Branches N particles into N * branch_factor candidate paths.
-    2. Scores candidates using analytical drift consistency and mode diversity.
-    3. Uses Birth-Death population interaction to filter the best N surviving particles.
+    This is an exploratory branch/filter method, not a canonical particle
+    filter: the candidate potential is the reverse-transition log density and
+    an optional diversity bonus, followed by a separate BD-like exchange.
+    It must run with stochastic DDIM (eta > 0) or DDPM so candidate branches
+    have a non-degenerate transition distribution.
     """
 
     def __init__(
@@ -42,15 +29,19 @@ class ParticleFilteringSolutionSpaceExplorer(SamplingModifier):
         diversity_weight: float = 0.1,
         min_timestep: int | None = 100,
         max_timestep: int | None = None,
-        max_event_probability: float = 0.25,
+        total_time: float = 1.0,
+        max_delta_tau: float = 0.005,
+        max_event_probability: float | None = 0.25,
         add_noise: float = 0.0,
     ):
         if branch_factor < 2:
-            raise ValueError("branch_factor must be at least 2 to explore alternative paths")
+            raise ValueError("branch_factor must be at least 2")
         if every_k_steps < 1:
             raise ValueError("every_k_steps must be positive")
-        if temperature <= 0:
-            raise ValueError("temperature must be positive")
+        if temperature <= 0 or total_time <= 0 or max_delta_tau <= 0:
+            raise ValueError("temperature, total_time, and max_delta_tau must be positive")
+        if add_noise < 0:
+            raise ValueError("add_noise must be non-negative")
 
         self.branch_factor = int(branch_factor)
         self.every_k_steps = int(every_k_steps)
@@ -58,209 +49,145 @@ class ParticleFilteringSolutionSpaceExplorer(SamplingModifier):
         self.diversity_weight = float(diversity_weight)
         self.min_timestep = int(min_timestep) if min_timestep is not None else None
         self.max_timestep = int(max_timestep) if max_timestep is not None else None
-        self.max_event_probability = (
-            float(max_event_probability) if max_event_probability is not None else None
-        )
+        self.total_time = float(total_time)
+        self.max_delta_tau = float(max_delta_tau)
+        self.max_event_probability = max_event_probability
         self.add_noise = float(add_noise)
 
-    def _explore_solution_branches(
-        self,
-        x_curr: torch.Tensor,
-        timestep: int,
-        prev_timestep: int,
-        model: nn.Module,
-        scheduler,
-        generator: torch.Generator | None = None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        """Generate B candidate transitions per particle and score their solution potential."""
-        N = x_curr.shape[0]
-        B = self.branch_factor
-
-        ts = torch.full((N,), timestep, device=x_curr.device, dtype=torch.long)
-        alpha_bar = scheduler.alpha_bars[timestep].to(x_curr)
-        alpha_bar_prev = (
-            scheduler.alpha_bars[prev_timestep].to(x_curr)
-            if prev_timestep >= 0
-            else alpha_bar.new_tensor(1.0)
+    def _explore_solution_branches(self, source, timestep, previous_timestep,
+                                    model, scheduler, metadata, generator):
+        mean, variance = reverse_transition_parameters(
+            source, timestep, previous_timestep, model, scheduler, metadata
         )
-
-        with torch.no_grad():
-            predicted_noise = model(x_curr, ts)
-
-        predicted_clean = (x_curr - (1 - alpha_bar).sqrt() * predicted_noise) / alpha_bar.sqrt()
-        if getattr(scheduler, "clip_sample", False):
-            limit = getattr(scheduler, "clip_sample_range", 1.0)
-            predicted_clean = predicted_clean.clamp(-limit, limit)
-
-        sigma = torch.sqrt(
-            (
-                (1 - alpha_bar_prev)
-                / (1 - alpha_bar)
-                * (1 - alpha_bar / alpha_bar_prev)
-            ).clamp(min=1e-20)
-        )
-        direction = (1 - alpha_bar_prev - sigma.square()).clamp(min=0).sqrt() * predicted_noise
-        mu = alpha_bar_prev.sqrt() * predicted_clean + direction
-
-        # Generate B stochastic perturbations for each parent particle
+        if variance.item() <= 0:
+            raise ValueError("the selected reverse transition has zero variance")
+        count = source.shape[0]
         candidates = []
         potentials = []
-
-        for b in range(B):
-            noise_b = torch.randn(
-                x_curr.shape, device=x_curr.device, dtype=x_curr.dtype, generator=generator
+        dimensions = source[0].numel()
+        for _ in range(self.branch_factor):
+            noise = torch.randn(
+                source.shape, device=source.device, dtype=source.dtype,
+                generator=generator,
             )
-            cand = mu + sigma * noise_b
-            candidates.append(cand)
+            candidate = mean + variance.sqrt() * noise
+            residual = (candidate - mean).reshape(count, -1)
+            log_probability = (
+                -0.5 * residual.square().sum(dim=1) / variance
+                -0.5 * dimensions * torch.log(2 * torch.pi * variance)
+            )
+            candidates.append(candidate)
+            potentials.append(log_probability)
 
-            # Potential score: log-density under the Gaussian transition kernel
-            diff = cand - mu
-            sq_err = diff.reshape(diff.shape[0], -1).square().sum(dim=1)
-            pot = -0.5 * sq_err / (sigma.square().clamp_min(1e-12))
-            potentials.append(pot)
-
-        # Reshape to (N * B, ...)
-        all_candidates = torch.cat(candidates, dim=0)  # (N*B, C, H, W)
-        all_potentials = torch.cat(potentials, dim=0)  # (N*B,)
-
-        # Diversity potential bonus: encourage candidates that differ from batch mean
+        all_candidates = torch.cat(candidates, dim=0)
+        all_potentials = torch.cat(potentials, dim=0)
         if self.diversity_weight > 0:
-            cand_flat = all_candidates.reshape(all_candidates.shape[0], -1)
-            mean_cand = cand_flat.mean(dim=0, keepdim=True)
-            dist_to_mean = (cand_flat - mean_cand).square().sum(dim=1)
-            all_potentials = all_potentials + self.diversity_weight * dist_to_mean
-
+            flat = all_candidates.reshape(all_candidates.shape[0], -1)
+            distance_from_mean = (flat - flat.mean(dim=0, keepdim=True)).square().sum(dim=1)
+            all_potentials = all_potentials + self.diversity_weight * distance_from_mean
         return all_candidates, all_potentials
 
-    def apply(
-        self, state: SamplingState, *, model, scheduler, generator
-    ) -> SamplingState:
-        samples = state.samples
+    def apply(self, state: SamplingState, *, model, scheduler, generator) -> SamplingState:
         context = state.context
         if context is None:
             return state
-
         if (
             context.is_clean_sample
             or context.state_timestep is None
             or context.state_coordinates == "clean_x0"
         ):
             return state
-
         if not 0 <= context.step_index < context.num_steps:
             return state
         if (context.step_index + 1) % self.every_k_steps != 0:
             return state
+        if self.min_timestep is not None and state.timestep < self.min_timestep:
+            return state
+        if self.max_timestep is not None and state.timestep > self.max_timestep:
+            return state
 
-        timestep = state.timestep
-        if timestep is not None:
-            if self.min_timestep is not None and timestep < self.min_timestep:
-                return state
-            if self.max_timestep is not None and timestep > self.max_timestep:
-                return state
+        source = state.source_samples
+        if source is None:
+            raise ValueError(
+                "particle filtering requires source_samples; use SamplingPipeline "
+                "or provide the pre-step state"
+            )
+        samples = state.samples
+        count = samples.shape[0]
+        if source.shape != samples.shape:
+            raise ValueError("source and destination populations must have matching shapes")
+        if count < 2:
+            return state
 
-        N = samples.shape[0]
-        prev_timestep = state.previous_timestep
-
-        # 1. Branch and explore solution space
         candidates, potentials = self._explore_solution_branches(
-            samples, timestep, prev_timestep, model, scheduler, generator=generator
+            source, state.timestep, state.previous_timestep, model, scheduler,
+            state.metadata, generator,
         )
-        total_pool_size = candidates.shape[0]
-
-        # 2. Candidate Selection preserving population diversity:
-        # Each parent particle i selects its best exploratory candidate branch
-        B = self.branch_factor
-        potentials_reshaped = potentials.reshape(B, N)
-        branch_weights = torch.softmax(potentials_reshaped / self.temperature, dim=0)
+        branches = potentials.reshape(self.branch_factor, count)
+        branch_weights = torch.softmax(branches / self.temperature, dim=0)
         chosen_branches = torch.multinomial(
             branch_weights.T, num_samples=1, generator=generator
-        ).squeeze(-1)  # (N,)
-        chosen_indices = chosen_branches * N + torch.arange(
-            N, device=samples.device
-        )
-        surviving_samples = candidates.index_select(0, chosen_indices)
-        surviving_potentials = potentials.index_select(0, chosen_indices)
+        ).squeeze(-1)
+        chosen_indices = chosen_branches * count + torch.arange(count, device=samples.device)
+        selected_samples = candidates.index_select(0, chosen_indices)
+        selected_potentials = potentials.index_select(0, chosen_indices)
 
-        # 3. Controlled Birth-Death cross-particle exchange (strictly capped to prevent collapse)
+        eligible_updates = context.num_steps - int(context.has_clean_endpoint)
+        intervention_count = max(1, eligible_updates // self.every_k_steps)
+        delta_tau = min(self.total_time / intervention_count, self.max_delta_tau)
+        births = deaths = 0
+        cloned_positions = []
         if self.max_event_probability is not None and self.max_event_probability > 0:
-            centered_pot = surviving_potentials - surviving_potentials.mean()
-            beta = -centered_pot  # low potential -> beta > 0 (kill)
-            event_probability = (-torch.expm1(-beta.abs() * 0.005)).clamp(
-                max=self.max_event_probability
-            )
-            uniforms = torch.rand(N, device=samples.device, generator=generator)
-            selected = uniforms < event_probability
-            partners = torch.randint(
-                N - 1, (N,), device=samples.device, generator=generator
-            )
-
+            beta = -(selected_potentials - selected_potentials.mean())
+            event_probability = -torch.expm1(-beta.abs() * delta_tau)
+            event_probability = event_probability.clamp(max=float(self.max_event_probability))
+            selected = torch.rand(count, device=samples.device, generator=generator) < event_probability
+            partners = torch.randint(count - 1, (count,), device=samples.device, generator=generator)
             event_data = torch.stack(
-                (
-                    selected.to(torch.float32),
-                    beta.gt(0).to(torch.float32),
-                    partners.to(torch.float32),
-                ),
-                dim=1,
+                (selected.float(), beta.gt(0).float(), partners.float()), dim=1
             ).cpu().tolist()
-
-            source_indices = list(range(N))
-            cloned_positions = []
-            for idx, (is_sel, is_over, raw_partner) in enumerate(event_data):
-                if not is_sel:
+            source_indices = list(range(count))
+            for index, (is_selected, is_overrepresented, raw_partner) in enumerate(event_data):
+                if not is_selected:
                     continue
                 partner = int(raw_partner)
-                if partner >= idx:
+                if partner >= index:
                     partner += 1
-                if is_over:
-                    source_indices[idx] = source_indices[partner]
-                    cloned_positions.append(idx)
+                if is_overrepresented:
+                    source_indices[index] = source_indices[partner]
+                    cloned_positions.append(index)
+                    deaths += 1
                 else:
-                    source_indices[partner] = source_indices[idx]
+                    source_indices[partner] = source_indices[index]
                     cloned_positions.append(partner)
-
-            filtered_samples = surviving_samples.index_select(
+                    births += 1
+            selected_samples = selected_samples.index_select(
                 0, torch.tensor(source_indices, device=samples.device, dtype=torch.long)
             )
-            if self.add_noise > 0 and cloned_positions:
-                unique_cloned = sorted(list(set(cloned_positions)))
-                noise = torch.randn(
-                    (len(unique_cloned), *samples.shape[1:]),
-                    device=samples.device,
-                    dtype=samples.dtype,
-                    generator=generator,
-                )
-                scale = self.add_noise
-                if (
-                    timestep is not None
-                    and hasattr(scheduler, "alpha_bars")
-                    and int(timestep) < len(scheduler.alpha_bars)
-                ):
-                    alpha_bar = scheduler.alpha_bars[int(timestep)].to(samples)
-                    sigma_t = (1.0 - alpha_bar).clamp_min(1e-12).sqrt()
-                    scale = self.add_noise * sigma_t
-                cloned_tensor_idx = torch.tensor(unique_cloned, device=samples.device, dtype=torch.long)
-                filtered_samples = filtered_samples.clone()
-                filtered_samples[cloned_tensor_idx] = (
-                    filtered_samples[cloned_tensor_idx] + scale * noise
-                )
-        else:
-            filtered_samples = surviving_samples
+
+        if self.add_noise > 0 and cloned_positions:
+            positions = sorted(set(cloned_positions))
+            noise = torch.randn(
+                (len(positions), *samples.shape[1:]), device=samples.device,
+                dtype=samples.dtype, generator=generator,
+            )
+            scale = self.add_noise * coordinate_noise_std(
+                samples, context.state_timestep, scheduler, context.state_coordinates
+            )
+            selected_samples = selected_samples.clone()
+            selected_samples[torch.tensor(positions, device=samples.device)] += scale * noise
 
         metadata = dict(state.metadata)
-        metadata.update(
-            {
-                "filter_pool_size": total_pool_size,
-                "filter_retained": N,
-                "filter_mean_potential": float(potentials.mean().item()),
-                "acceleration_mode": "particle_filtering_exploration",
-            }
-        )
-
+        metadata.update({
+            "filter_pool_size": int(candidates.shape[0]),
+            "filter_retained": count,
+            "filter_mean_potential": float(potentials.mean().item()),
+            "filter_bd_events": births + deaths,
+            "filter_bd_births": births,
+            "filter_bd_deaths": deaths,
+            "acceleration_mode": "particle_filtering_exploration",
+        })
         return SamplingState(
-            filtered_samples,
-            state.timestep,
-            state.previous_timestep,
-            metadata,
-            context=state.context,
+            selected_samples, state.timestep, state.previous_timestep, metadata,
+            context=state.context, source_samples=state.source_samples,
         )

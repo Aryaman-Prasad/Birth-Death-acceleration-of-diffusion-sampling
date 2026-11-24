@@ -8,6 +8,10 @@ from diffusion.schedulers.base import NoiseScheduler
 
 
 class DDPMSampler(Sampler):
+    def sampling_metadata(self, timestep: int, previous_timestep: int,
+                          scheduler: NoiseScheduler) -> dict:
+        return {"sampler_name": "ddpm"}
+
     def inference_timesteps(self, scheduler: NoiseScheduler, num_inference_steps: int | None,
                             device: torch.device) -> torch.Tensor:
         if num_inference_steps not in (None, scheduler.num_train_timesteps):

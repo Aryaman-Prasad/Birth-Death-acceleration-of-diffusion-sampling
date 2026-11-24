@@ -64,7 +64,7 @@ class LangevinSampler(Sampler):
 
     def sampling_metadata(self, timestep: int, previous_timestep: int,
                           scheduler: NoiseScheduler) -> dict:
-        return {"langevin_step_size": self.step_size}
+        return {"sampler_name": "langevin", "langevin_step_size": self.step_size}
 
     def sampling_context(self, timestep: int, previous_timestep: int,
                          scheduler: NoiseScheduler) -> SamplingContext:
@@ -97,6 +97,10 @@ class AnnealedLangevinSampler(Sampler):
             raise ValueError("steps_per_level must be positive")
         self.step_size = step_size
         self.steps_per_level = steps_per_level
+
+    def sampling_metadata(self, timestep: int, previous_timestep: int,
+                          scheduler: NoiseScheduler) -> dict:
+        return {"sampler_name": "annealed-langevin", "langevin_step_size": self.step_size}
 
     def inference_timesteps(self, scheduler: NoiseScheduler, num_inference_steps: int | None,
                             device: torch.device) -> torch.Tensor:

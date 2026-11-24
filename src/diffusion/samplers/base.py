@@ -19,7 +19,7 @@ class Sampler(ABC):
     def sampling_metadata(self, timestep: int, previous_timestep: int,
                           scheduler: NoiseScheduler) -> dict:
         """Return sampler-specific metadata in addition to the state context."""
-        return {}
+        return {"sampler_name": type(self).__name__}
 
     def sampling_context(self, timestep: int, previous_timestep: int,
                          scheduler: NoiseScheduler) -> SamplingContext:

@@ -2,7 +2,11 @@
 
 import torch
 
-from diffusion.acceleration.base import SamplingModifier, SamplingState
+from diffusion.acceleration.base import (
+    SamplingModifier,
+    SamplingState,
+    coordinate_noise_std,
+)
 from diffusion.sampling import SamplingContext
 from diffusion.targets.base import TargetDistribution
 
@@ -177,15 +181,9 @@ class BirthDeathAcceleration(SamplingModifier):
                 dtype=samples.dtype,
                 generator=generator,
             )
-            scale = self.add_noise
-            if (
-                timestep is not None
-                and hasattr(scheduler, "alpha_bars")
-                and int(timestep) < len(scheduler.alpha_bars)
-            ):
-                alpha_bar = scheduler.alpha_bars[int(timestep)].to(samples)
-                sigma_t = (1.0 - alpha_bar).clamp_min(1e-12).sqrt()
-                scale = self.add_noise * sigma_t
+            scale = self.add_noise * coordinate_noise_std(
+                samples, context.state_timestep, scheduler, context.state_coordinates
+            )
             cloned_tensor_idx = torch.tensor(unique_cloned, device=samples.device, dtype=torch.long)
             updated = updated.clone()
             updated[cloned_tensor_idx] = updated[cloned_tensor_idx] + scale * noise
@@ -197,5 +195,6 @@ class BirthDeathAcceleration(SamplingModifier):
             "birth_death_population": population,
         })
         return SamplingState(
-            updated, state.timestep, state.previous_timestep, metadata, context=state.context
+            updated, state.timestep, state.previous_timestep, metadata,
+            context=state.context, source_samples=state.source_samples,
         )

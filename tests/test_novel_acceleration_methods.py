@@ -22,6 +22,7 @@ from diffusion.acceleration import (
     ParticleFilteringSolutionSpaceExplorer,
     SMCTransitionLikelihoodAcceleration,
 )
+from diffusion.acceleration.reverse_transition import reverse_transition_parameters
 from diffusion.acceleration.base import SamplingState
 from diffusion.sampling import SamplingContext
 from diffusion.schedulers.linear import LinearScheduler
@@ -53,6 +54,22 @@ class VelocityNet(nn.Module):
         return self.linear2(torch.relu(self.linear1(xt)))
 
 
+class LinearVelocity(nn.Module):
+    """Linear CNF field with a closed-form Gaussian marginal."""
+
+    def __init__(self, rate: float):
+        super().__init__()
+        self.rate = float(rate)
+
+    def forward(self, x: torch.Tensor, t: torch.Tensor) -> torch.Tensor:
+        return self.rate * x
+
+
+class ZeroNoiseModel(nn.Module):
+    def forward(self, x: torch.Tensor, timesteps: torch.Tensor) -> torch.Tensor:
+        return torch.zeros_like(x)
+
+
 def test_smc_transition_likelihood_step():
     """Verify that SMC reverse transition density acceleration runs in O(N) and updates state."""
     scheduler = LinearScheduler(num_train_timesteps=100)
@@ -62,45 +79,66 @@ def test_smc_transition_likelihood_step():
         every_k_steps=1,
         total_time=1.0,
         temperature=1.0,
+        min_timestep=0,
     )
 
-    particles_step1 = torch.randn(8, 3, 16, 16)
-    context_step1 = SamplingContext(
+    source = torch.randn(8, 3, 16, 16)
+    destination = source + 0.05 * torch.randn_like(source)
+    context = SamplingContext(
         state_coordinates="x_t",
-        state_timestep=80,
+        state_timestep=70,
         is_clean_sample=False,
         step_index=0,
         num_steps=10,
         has_clean_endpoint=False,
     )
-    state1 = SamplingState(
-        samples=particles_step1, timestep=90, previous_timestep=80, context=context_step1
+    state = SamplingState(
+        samples=destination,
+        timestep=80,
+        previous_timestep=70,
+        metadata={"sampler_name": "ddim", "eta": 1.0},
+        context=context,
+        source_samples=source,
     )
     gen = torch.Generator().manual_seed(42)
-
-    # First step: caches previous state
-    state2 = modifier.apply(state1, model=model, scheduler=scheduler, generator=gen)
-    assert state2.samples.shape == particles_step1.shape
-
-    # Second step: calculates p_theta(x_{t-1} | x_t) and applies birth-death
-    particles_step2 = particles_step1 + 0.05 * torch.randn_like(particles_step1)
-    context_step2 = SamplingContext(
-        state_coordinates="x_t",
-        state_timestep=70,
-        is_clean_sample=False,
-        step_index=1,
-        num_steps=10,
-        has_clean_endpoint=False,
-    )
-    state3 = SamplingState(
-        samples=particles_step2, timestep=80, previous_timestep=70, context=context_step2
-    )
-
-    result_state = modifier.apply(state3, model=model, scheduler=scheduler, generator=gen)
+    result_state = modifier.apply(state, model=model, scheduler=scheduler, generator=gen)
     assert result_state.samples.shape == (8, 3, 16, 16)
     assert "smc_events" in result_state.metadata
     assert "smc_mean_log_prob" in result_state.metadata
-    assert result_state.metadata["acceleration_mode"] == "smc_reverse_transition"
+    assert result_state.metadata["acceleration_mode"] == "smc_reverse_transition_heuristic"
+
+
+def test_reverse_transition_parameters_match_ddpm_posterior():
+    scheduler = LinearScheduler(num_train_timesteps=100)
+    source = torch.randn(4, 2)
+    timestep = 80
+    previous_timestep = 79
+    model = ZeroNoiseModel()
+    mean, variance = reverse_transition_parameters(
+        source, timestep, previous_timestep, model, scheduler,
+        {"sampler_name": "ddpm"},
+    )
+    alpha_bar = scheduler.alpha_bars[timestep]
+    alpha_bar_previous = scheduler.alpha_bars_prev[timestep]
+    beta = scheduler.betas[timestep]
+    alpha = scheduler.alphas[timestep]
+    predicted_clean = source / alpha_bar.sqrt()
+    expected_mean = (
+        beta * alpha_bar_previous.sqrt() / (1 - alpha_bar) * predicted_clean
+        + (1 - alpha_bar_previous) * alpha.sqrt() / (1 - alpha_bar) * source
+    )
+    expected_variance = beta * (1 - alpha_bar_previous) / (1 - alpha_bar)
+    assert torch.allclose(mean, expected_mean)
+    assert torch.allclose(variance, expected_variance)
+
+
+def test_transition_likelihood_rejects_deterministic_ddim():
+    scheduler = LinearScheduler(num_train_timesteps=100)
+    with pytest.raises(ValueError, match="eta > 0"):
+        reverse_transition_parameters(
+            torch.randn(2, 2), 80, 70, ZeroNoiseModel(), scheduler,
+            {"sampler_name": "ddim", "eta": 0.0},
+        )
 
 
 def test_continuous_normalizing_flow_target():
@@ -124,6 +162,28 @@ def test_continuous_normalizing_flow_target():
     assert torch.isfinite(scores).all(), "Scores must be finite"
 
 
+def test_cnf_integrates_divergence_and_score_under_no_grad():
+    rate = 0.35
+    prior_std = 1.2
+    flow_target = ContinuousNormalizingFlowTarget(
+        velocity_net=LinearVelocity(rate),
+        prior_std=prior_std,
+        divergence_method="exact",
+        integration_steps=64,
+    )
+    scheduler = LinearScheduler(num_train_timesteps=100)
+    samples = torch.tensor([[0.25, -0.7], [1.1, 0.4]])
+    timestep = 37
+    normalized_time = timestep / (scheduler.num_train_timesteps - 1)
+    variance = prior_std**2 * math.exp(-2 * rate * (1 - normalized_time))
+    expected = -math.log(2 * math.pi * variance) - samples.square().sum(dim=1) / (2 * variance)
+    with torch.no_grad():
+        actual = flow_target.log_prob(samples, timestep, scheduler)
+    assert torch.allclose(actual, expected, atol=2e-5, rtol=2e-5)
+    score = flow_target.score(samples, timestep, scheduler)
+    assert torch.allclose(score, -samples / variance, atol=2e-5, rtol=2e-5)
+
+
 def test_flow_birth_death_step():
     """Verify Birth-Death acceleration using exact flow log-density."""
     v_net = VelocityNet(dim=2)
@@ -137,6 +197,7 @@ def test_flow_birth_death_step():
         every_k_steps=1,
         total_time=1.0,
         bandwidth=0.3,
+        min_timestep=0,
     )
 
     particles = torch.randn(16, 2)
@@ -157,7 +218,7 @@ def test_flow_birth_death_step():
     assert new_state.samples.shape == particles.shape
     assert "flow_bd_events" in new_state.metadata
     assert "flow_mean_exact_logp" in new_state.metadata
-    assert new_state.metadata["acceleration_mode"] == "exact_flow_birth_death"
+    assert new_state.metadata["acceleration_mode"] == "flow_target_birth_death"
 
 
 def test_particle_filtering_solution_explorer():
@@ -169,6 +230,7 @@ def test_particle_filtering_solution_explorer():
         branch_factor=3,
         every_k_steps=1,
         temperature=1.0,
+        min_timestep=0,
     )
 
     particles = torch.randn(8, 3, 16, 16)
@@ -181,7 +243,12 @@ def test_particle_filtering_solution_explorer():
         has_clean_endpoint=False,
     )
     state = SamplingState(
-        samples=particles, timestep=60, previous_timestep=50, context=context
+        samples=particles + 0.01 * torch.randn_like(particles),
+        timestep=60,
+        previous_timestep=50,
+        metadata={"sampler_name": "ddim", "eta": 1.0},
+        context=context,
+        source_samples=particles,
     )
     gen = torch.Generator().manual_seed(42)
 
