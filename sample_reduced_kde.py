@@ -48,8 +48,16 @@ DEFAULT_PRETRAINED_MODEL = "google/ddpm-cifar10-32"
 
 
 def _device(name: str) -> torch.device:
+    """Resolve torch device, falling back to CPU if CUDA is unavailable."""
     if name == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if name.startswith("cuda") and not torch.cuda.is_available():
+        print(
+            f"[!] Warning: Requested device '{name}', but CUDA is unavailable "
+            "(Torch not compiled with CUDA or no GPU detected). Falling back to 'cpu'.",
+            file=sys.stderr,
+        )
+        return torch.device("cpu")
     return torch.device(name)
 
 
@@ -421,7 +429,7 @@ def main(argv=None):
     unique_ratio = float(torch.unique(flat, dim=0).shape[0] / samples.shape[0])
     print(
         f"[+] Completed: elapsed={metrics.elapsed_seconds:.3f}s | "
-        f"sec/sample={metrics.seconds_per_sample:.4f} | "
+        f"image/sec={metrics.samples_per_second:.2f} | "
         f"unique_fraction={unique_ratio:.4f}"
     )
 
@@ -444,6 +452,7 @@ def main(argv=None):
             "sampler_steps": metrics.sampler_steps,
             "sample_count": metrics.sample_count,
             "elapsed_seconds": metrics.elapsed_seconds,
+            "image_per_sec": metrics.samples_per_second,
             "seconds_per_sample": metrics.seconds_per_sample,
             "unique_fraction": unique_ratio,
             "kde_reduce": args.kde_reduce,

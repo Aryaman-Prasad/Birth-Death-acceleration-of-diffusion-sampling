@@ -86,6 +86,8 @@ python3 -m pip install -e ".[pretrained]"
 python3 -m pip install -e ".[fid]"
 ```
 
+> **Kaggle / Cloud GPU Note:** Ensure the notebook **Accelerator** is set to **GPU** (`T4` / `P100`) and avoid overwriting the preinstalled CUDA build of PyTorch (you can run `python3 -m pip install --no-deps -e .` on Kaggle, or pass `--device auto` so CPU-only environments fall back gracefully).
+
 ### Downloading Datasets (`wget`)
 
 > **Note:** Synthetic datasets (`--dataset toy-mixture`, `--dataset toy-images`) and the 2D oracle (`--toy-mixture-oracle`) are generated in memory and require no external downloads.
@@ -156,7 +158,7 @@ python3 sample.py --checkpoint checkpoints/ddpm.pt --sampler ddpm --count 16 --o
 python3 sample.py --checkpoint checkpoints/ddpm.pt --sampler ddim --steps 50 --eta 0.0 --seed 7 --count 16
 
 # Sample directly from pretrained Hugging Face DDPM U-Net (google/ddpm-cifar10-32)
-python3 sample.py --pretrained-model-id google/ddpm-cifar10-32 --sampler ddim --steps 25 --eta 1.0 --count 16 --device cuda
+python3 sample.py --pretrained-model-id google/ddpm-cifar10-32 --sampler ddim --steps 25 --eta 1.0 --count 16 --device auto
 
 # Annealed Langevin or fixed-target Langevin sampling
 python3 sample.py --checkpoint checkpoints/ddpm.pt --sampler annealed-langevin --steps 20 --langevin-steps-per-level 5
@@ -171,7 +173,7 @@ python3 sample.py --bd-unet --pretrained-model-id google/ddpm-cifar10-32 --targe
 
 # Empirical data target with FID-2048 evaluation
 python3 sample.py --empirical-data-target --target-dataset cifar10 --target-download --sampler ddim --steps 25 --eta 1.0 \
-    --birth-death --fid --fid-dataset cifar10 --fid-samples 1000 --fid-batch-size 64 --device cuda
+    --birth-death --fid --fid-dataset cifar10 --fid-samples 1000 --fid-batch-size 64 --device auto
 ```
 
 <details>
@@ -193,23 +195,23 @@ Supports **Manifold Reduced-KDE** (`reduced_kde`), **Direct Linear Pixel-PCA** (
 ```bash
 # 1. Manifold Reduced-KDE (25D U-Net Bottleneck + offline SVD)
 python3 sample_reduced_kde.py --empirical-data-target --target-dataset cifar10 --target-download \
-    --sampler ddim --steps 25 --eta 1.0 --birth-death --kde_reduce 25 --unet-layer bottleneck --projection-method pca --count 16 --device cuda
+    --sampler ddim --steps 25 --eta 1.0 --birth-death --kde_reduce 25 --unet-layer bottleneck --projection-method pca --count 16 --device auto
 
 # 2. Direct Linear Pixel-PCA (zero convolutions, single GPU Tensor Core GEMM)
 python3 sample_reduced_kde.py --empirical-data-target --target-dataset cifar10 \
-    --sampler ddim --steps 10 --eta 1.0 --birth-death --pca --kde_reduce 25 --count 16 --device cuda
+    --sampler ddim --steps 10 --eta 1.0 --birth-death --pca --kde_reduce 25 --count 16 --device auto
 
 # 3. Direct Pixel-PCA on high-resolution ImageFolder (e.g., CelebA-HQ 256x256, 4x4 grid)
 python3 sample_reduced_kde.py --empirical-data-target --target-dataset imagefolder --target-data-dir data/celeba --target-image-size 256 \
-    --sampler ddim --steps 25 --eta 1.0 --birth-death --pca --kde_reduce 10 --count 16 --nrow 4 --device cuda
+    --sampler ddim --steps 25 --eta 1.0 --birth-death --pca --kde_reduce 10 --count 16 --nrow 4 --device auto
 
 # 4. SMC Reverse Transition Weighting (O(N), no reference caching)
 python3 sample_reduced_kde.py --pretrained-model-id google/ddpm-cifar10-32 \
-    --sampler ddim --steps 10 --eta 1.0 --acceleration-method smc_transition --smc-temp 1.0 --bd-every-k 2 --bd-total-time 0.01 --count 16 --device cuda
+    --sampler ddim --steps 10 --eta 1.0 --acceleration-method smc_transition --smc-temp 1.0 --bd-every-k 2 --bd-total-time 0.01 --count 16 --device auto
 
 # 5. Particle Filtering Solution Space Explorer (branching B=2)
 python3 sample_reduced_kde.py --pretrained-model-id google/ddpm-cifar10-32 \
-    --sampler ddim --steps 50 --eta 1.0 --acceleration-method particle_filter --filter-branch-factor 2 --bd-every-k 2 --count 16 --device cuda
+    --sampler ddim --steps 50 --eta 1.0 --acceleration-method particle_filter --filter-branch-factor 2 --bd-every-k 2 --count 16 --device auto
 
 # 6. Flow Birth-Death (flow_exact) on 2D Toy Oracle
 python3 sample_reduced_kde.py --toy-mixture-oracle --sampler ddim --steps 25 --eta 1.0 \
@@ -235,40 +237,40 @@ python3 sample_reduced_kde.py --toy-mixture-oracle --sampler ddim --steps 25 --e
 
 ```bash
 # Baseline DDPM & DDIM throughput / timing sweep
-python3 benchmark.py --pretrained-model-id google/ddpm-cifar10-32 --steps 100 50 25 10 --eta 0.0 --count 16 --device cuda --output-dir baseline_data
+python3 benchmark.py --pretrained-model-id google/ddpm-cifar10-32 --steps 100 50 25 10 --eta 0.0 --count 16 --device auto --output-dir baseline_data
 
 # 2D Gaussian Mixture Ring verification + scatter & bar plots
 python3 scripts/run_and_plot_toy.py --count 512 --seed 42 --device auto --output-dir toy_results
 
 # Unified Multi-Method Benchmark (Baseline, Pixel-KDE, Reduced-KDE, Direct Pixel-PCA, SMC, Particle Filter, Flow-Exact)
 python3 scripts/run_reduced_kde_eval.py --dataset cifar10 --download --kde_reduce 25 --pca --compare-all-paradigms \
-    --steps 10 25 50 --bd-min-timestep 100 --bd-max-time 0.005 --bd-max-event-prob 0.25 --count 16 --no-fid --device cuda --output-dir reduced_kde_results
+    --steps 10 25 50 --bd-min-timestep 100 --bd-max-time 0.005 --bd-max-event-prob 0.25 --count 16 --no-fid --device auto --output-dir reduced_kde_results
 
 # Direct Pixel-PCA-only sweep (fast throughput benchmark across steps)
-python3 scripts/run_reduced_kde_eval.py --dataset cifar10 --pca-only --kde_reduce 10 --steps 5 10 25 50 --no-fid --device cuda
+python3 scripts/run_reduced_kde_eval.py --dataset cifar10 --pca-only --kde_reduce 10 --steps 5 10 25 50 --no-fid --device auto
 
 # CelebA-HQ 256 extreme-scale Pixel-PCA evaluation (4x4 grids)
 python3 scripts/run_reduced_kde_eval.py --dataset imagefolder --data-dir data/celeba --image-size 256 \
-    --pca-only --kde_reduce 10 --steps 25 --count 16 --no-fid --device cuda
+    --pca-only --kde_reduce 10 --steps 25 --count 16 --no-fid --device auto
 
 # Pretrained U-Net + Empirical KDE Birth-Death evaluation (BD-UNet)
 python3 scripts/run_bd_unet_eval.py --steps 10 25 50 --reference-count 512 --eta 1.0 \
-    --bd-min-timestep 100 --bd-max-time 0.005 --bd-max-event-prob 0.25 --device cuda --output-dir bd_unet_results
+    --bd-min-timestep 100 --bd-max-time 0.005 --bd-max-event-prob 0.25 --device auto --output-dir bd_unet_results
 # (Add --fid --fid-samples 512 for FID evaluation)
 
 # Standalone Non-KDE Paradigm Benchmarks
 python3 scripts/run_smc_eval.py --model-id google/ddpm-cifar10-32 --dataset cifar10 --steps 10 25 50 \
-    --smc-every-k 2 --smc-total-time 0.01 --smc-temp 1.0 --bd-min-timestep 100 --no-fid --device cuda --output-dir smc_benchmark_results
+    --smc-every-k 2 --smc-total-time 0.01 --smc-temp 1.0 --bd-min-timestep 100 --no-fid --device auto --output-dir smc_benchmark_results
 
 python3 scripts/run_particle_filter_eval.py --model-id google/ddpm-cifar10-32 --dataset cifar10 --steps 10 25 50 \
-    --branch-factor 2 --filter-every-k 2 --filter-temp 1.0 --diversity-weight 0.1 --bd-min-timestep 100 --no-fid --device cuda --output-dir pf_results
+    --branch-factor 2 --filter-every-k 2 --filter-temp 1.0 --diversity-weight 0.1 --bd-min-timestep 100 --no-fid --device auto --output-dir pf_results
 
 python3 scripts/run_exact_flow_eval.py --model-id google/ddpm-cifar10-32 --dataset cifar10 --steps 10 25 50 \
-    --flow-every-k 2 --flow-total-time 0.01 --flow-bandwidth 0.3 --bd-min-timestep 100 --no-fid --device cuda --output-dir flow_results
+    --flow-every-k 2 --flow-total-time 0.01 --flow-bandwidth 0.3 --bd-min-timestep 100 --no-fid --device auto --output-dir flow_results
 
 # Deliverable 4 Ablation Grid (steps, cadence k, budget tau, stochasticity eta)
-python3 scripts/run_deliverable4_eval.py --dataset cifar10 --device cuda --output-dir deliverable4_results
-python3 scripts/run_deliverable4_eval.py --dataset cifar10 --quick --fid-samples 0 --device cuda
+python3 scripts/run_deliverable4_eval.py --dataset cifar10 --device auto --output-dir deliverable4_results
+python3 scripts/run_deliverable4_eval.py --dataset cifar10 --quick --fid-samples 0 --device auto
 ```
 
 ---

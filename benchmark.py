@@ -98,7 +98,7 @@ def run_benchmark(
     csv_file = out_path / "benchmark_results.csv"
 
     print("\n" + "=" * 75)
-    print(f"{'Sampler':<10} | {'Steps':<8} | {'Total Time (s)':<15} | {'Sec/Sample':<12} | {'Steps/Sec':<10}")
+    print(f"{'Sampler':<10} | {'Steps':<8} | {'Total Time (s)':<15} | {'Image/Sec':<12} | {'Steps/Sec':<10}")
     print("-" * 75)
 
     for sampler_name, num_steps, sampler_eta in configs:
@@ -122,8 +122,8 @@ def run_benchmark(
             torch.cuda.synchronize(device)
         elapsed = time.perf_counter() - start
 
-        sec_per_sample = elapsed / count
-        steps_per_sec = num_steps / elapsed
+        image_per_sec = count / elapsed if elapsed > 0 else 0.0
+        steps_per_sec = num_steps / elapsed if elapsed > 0 else 0.0
 
         img_filename = f"{sampler_name}_{num_steps}steps.png" if samples.ndim == 4 else f"{sampler_name}_{num_steps}steps.pt"
         save_target = out_path / img_filename
@@ -137,18 +137,18 @@ def run_benchmark(
             "steps": num_steps,
             "count": count,
             "total_time_sec": round(elapsed, 4),
-            "sec_per_sample": round(sec_per_sample, 4),
+            "image_per_sec": round(image_per_sec, 2),
             "steps_per_sec": round(steps_per_sec, 2),
             "image_path": str(save_target),
         })
 
-        print(f"{sampler_name:<10} | {num_steps:<8} | {elapsed:<15.2f} | {sec_per_sample:<12.4f} | {steps_per_sec:<10.2f}")
+        print(f"{sampler_name:<10} | {num_steps:<8} | {elapsed:<15.2f} | {image_per_sec:<12.2f} | {steps_per_sec:<10.2f}")
 
     print("=" * 75)
 
     # Save CSV
     with open(csv_file, "w", newline="") as f:
-        writer = csv.DictWriter(f, fieldnames=["sampler", "steps", "count", "total_time_sec", "sec_per_sample", "steps_per_sec", "image_path"])
+        writer = csv.DictWriter(f, fieldnames=["sampler", "steps", "count", "total_time_sec", "image_per_sec", "steps_per_sec", "image_path"])
         writer.writeheader()
         writer.writerows(results)
 

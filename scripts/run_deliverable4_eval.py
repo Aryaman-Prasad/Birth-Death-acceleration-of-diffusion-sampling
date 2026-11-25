@@ -337,7 +337,7 @@ def main():
 
     print(f"\n[+] Executing {len(unique_cases)} evaluation cases for Deliverable 4...")
     print("=" * 85)
-    print(f"{'Case Name':<24} | {'Steps':<5} | {'BD':<5} | {'Time(s)':<8} | {'Sec/Samp':<9} | {'Unique':<8} | {'FID':<7}")
+    print(f"{'Case Name':<24} | {'Steps':<5} | {'BD':<5} | {'Time(s)':<8} | {'Image/s':<9} | {'Unique':<8} | {'FID':<7}")
     print("-" * 85)
 
     results = []
@@ -370,7 +370,7 @@ def main():
 
         fid_str = f"{rec['fid']:.2f}" if rec['fid'] is not None else "N/A"
         bd_str = "YES" if rec["birth_death"] else "NO"
-        print(f"{c['name']:<24} | {rec['steps']:<5} | {bd_str:<5} | {rec['elapsed_seconds']:<8.2f} | {rec['seconds_per_sample']:<9.4f} | {rec['unique_fraction']:<8.2f} | {fid_str:<7}")
+        print(f"{c['name']:<24} | {rec['steps']:<5} | {bd_str:<5} | {rec['elapsed_seconds']:<8.2f} | {rec['samples_per_second']:<9.2f} | {rec['unique_fraction']:<8.2f} | {fid_str:<7}")
 
     print("=" * 85)
 

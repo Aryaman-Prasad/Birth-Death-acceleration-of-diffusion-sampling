@@ -30,8 +30,15 @@ DEFAULT_PRETRAINED_MODEL = "google/ddpm-cifar10-32"
 
 
 def _device(name: str) -> torch.device:
+    """Resolve torch device, falling back to CPU if CUDA is unavailable."""
     if name == "auto":
         return torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    if name.startswith("cuda") and not torch.cuda.is_available():
+        print(
+            f"warning: requested device '{name}', but CUDA is unavailable; falling back to 'cpu'.",
+            file=sys.stderr,
+        )
+        return torch.device("cpu")
     return torch.device(name)
 
 
@@ -660,10 +667,11 @@ def sample_main(argv=None):
     write_metrics(metrics_path, metrics, metadata, additional_metrics or None)
     print(f"saved {samples.shape[0]} samples to {output}")
     print(f"{unique_sample_label}={saved_preview_unique_count}/{samples.shape[0]}")
+    throughput_unit = "image/sec" if samples.ndim == 4 else "samples/s"
     print(f"sampler={args.sampler} | steps={metrics.sampler_steps} | NFE={metrics.nfe} | "
           f"model_forward_calls={metrics.model_forward_calls} | "
           f"time={metrics.elapsed_seconds:.2f}s | "
-          f"throughput={metrics.samples_per_second:.2f} samples/s")
+          f"throughput={metrics.samples_per_second:.2f} {throughput_unit}")
     if args.fid:
         print(f"FID-2048={fid_score:.4f} | samples={args.fid_samples} | "
               f"reference={args.fid_dataset} | evaluation_time={fid_seconds:.2f}s")
